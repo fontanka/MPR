@@ -1,0 +1,657 @@
+"""
+DICOM Loader Service
+
+Handles loading DICOM files from a folder and building a 3D volume.
+Supports:
+- Recursive folder scanning (subfolders)
+- Extension-agnostic DICOM detection
+- Multiple series selection
+- Lightweight scanning with progress callbacks
+- Fast DICOM detection using magic bytes
+"""
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Callable
+from dataclasses import dataclass
+import numpy as np
+import pydicom
+from pydicom.dataset import Dataset
+
+from ..types.measurement import PatientInfo, StudyInfo
+
+
+# DICOM magic bytes at offset 128
+DICOM_MAGIC = b'DICM'
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    """
+    Safely convert a value to float, handling pydicom MultiValue objects.
+    """
+    if value is None:
+        return default
+    try:
+        # If it's a MultiValue or list, get first element
+        if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
+            value = list(value)[0] if len(list(value)) > 0 else default
+        return float(value)
+    except (ValueError, TypeError, IndexError):
+        return default
+
+
+def get_z_position(ds) -> float:
+    """Get the Z position from a DICOM dataset safely."""
+    try:
+        ipp = ds.ImagePositionPatient
+        if hasattr(ipp, '__iter__'):
+            # Convert to list to handle MultiValue
+            ipp_list = [safe_float(x) for x in ipp]
+            return ipp_list[2] if len(ipp_list) > 2 else 0.0
+        return safe_float(ipp)
+    except Exception:
+        return 0.0
+
+
+def safe_int(value, default: int = 0) -> int:
+    """Safely convert a value to int, handling pydicom MultiValue and None."""
+    if value is None:
+        return default
+    try:
+        if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
+            value = list(value)[0] if len(list(value)) > 0 else default
+        return int(float(value))  # int(float()) handles decimal strings
+    except (ValueError, TypeError, IndexError):
+        return default
+
+
+@dataclass
+class SeriesInfo:
+    """Information about a DICOM series for selection."""
+    series_instance_uid: str
+    series_number: int
+    series_description: str
+    modality: str
+    num_slices: int
+    slice_thickness: float
+    patient_name: str
+    patient_id: str
+    study_date: str
+    study_description: str
+    file_paths: List[str]  # Paths to all files in this series
+    
+    def get_display_text(self) -> str:
+        """Get formatted text for display in selector."""
+        return (
+            f"Series {self.series_number}: {self.series_description}\n"
+            f"  Modality: {self.modality} | Slices: {self.num_slices} | "
+            f"Thickness: {self.slice_thickness:.2f}mm\n"
+            f"  Patient: {self.patient_name} ({self.patient_id})\n"
+            f"  Study: {self.study_description} ({self.study_date})"
+        )
+
+
+def is_dicom_file_fast(file_path: str) -> bool:
+    """
+    Quickly check if a file is likely a DICOM file by reading magic bytes.
+    This is MUCH faster than trying to parse with pydicom.
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            # Check for DICOM magic at offset 128
+            f.seek(128)
+            magic = f.read(4)
+            if magic == DICOM_MAGIC:
+                return True
+            
+            # Some DICOM files don't have preamble - check for common tags at start
+            f.seek(0)
+            start = f.read(132)
+            # Look for group 0008 (common start) - bytes 08 00 in little endian
+            if b'\x08\x00' in start[:16]:
+                return True
+            
+        return False
+    except Exception:
+        return False
+
+
+class DICOMLoader:
+    """Loads DICOM files and creates a 3D volume for MPR viewing."""
+    
+    def __init__(self):
+        self.slices: List[Dataset] = []
+        self.volume: Optional[np.ndarray] = None
+        self.spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+        self.origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.orientation: np.ndarray = np.eye(3)
+        
+        # DICOM identifiers
+        self.study_instance_uid: str = ""
+        self.series_instance_uid: str = ""
+        self.frame_of_reference_uid: str = ""
+        
+        # Patient and study info
+        self.patient_info: PatientInfo = PatientInfo()
+        self.study_info: StudyInfo = StudyInfo()
+        
+        # Image properties
+        self.window_center: float = 40.0
+        self.window_width: float = 400.0
+        self.rows: int = 0
+        self.cols: int = 0
+        
+        # Discovered series
+        self._series_files: Dict[str, List[str]] = {}
+        self._series_info: Dict[str, SeriesInfo] = {}
+        
+        # Progress callback
+        self._progress_callback: Optional[Callable[[int, int, str], None]] = None
+    
+    def set_progress_callback(self, callback: Callable[[int, int, str], None]):
+        """Set callback for progress updates: callback(current, total, message)"""
+        self._progress_callback = callback
+    
+    def _report_progress(self, current: int, total: int, message: str):
+        """Report progress if callback is set."""
+        if self._progress_callback:
+            self._progress_callback(current, total, message)
+    
+    def scan_folder(self, folder_path: str) -> List[SeriesInfo]:
+        """
+        Scan folder (recursively) for DICOM files and return available series.
+        Uses fast DICOM detection before full parsing.
+        """
+        folder = Path(folder_path)
+        if not folder.exists() or not folder.is_dir():
+            return []
+        
+        # Phase 1: Quick file enumeration
+        self._report_progress(0, 0, "Enumerating files...")
+        all_files = []
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                all_files.append(os.path.join(root, file))
+        
+        total_files = len(all_files)
+        if total_files == 0:
+            return []
+        
+        self._report_progress(0, total_files, f"Found {total_files} files, checking for DICOM...")
+        
+        # Phase 2: Fast DICOM detection (just magic bytes)
+        dicom_files = []
+        for i, file_path in enumerate(all_files):
+            if i % 100 == 0:
+                self._report_progress(i, total_files, f"Checking files... {i}/{total_files}")
+            if is_dicom_file_fast(file_path):
+                dicom_files.append(file_path)
+        
+        num_dicom = len(dicom_files)
+        if num_dicom == 0:
+            return []
+        
+        self._report_progress(0, num_dicom, f"Found {num_dicom} DICOM files, reading headers...")
+        
+        # Phase 3: Read headers (no pixel data) to group by series
+        self._series_files = {}
+        series_headers: Dict[str, Dataset] = {}
+        series_positions: Dict[str, List[Tuple[float, str]]] = {}
+        
+        for i, file_path in enumerate(dicom_files):
+            if i % 50 == 0:
+                self._report_progress(i, num_dicom, f"Reading headers... {i}/{num_dicom}")
+            
+            try:
+                ds = pydicom.dcmread(file_path, force=True, stop_before_pixels=True)
+                
+                # Must have these to be a valid CT slice
+                if not hasattr(ds, 'SeriesInstanceUID'):
+                    continue
+                if not hasattr(ds, 'ImagePositionPatient'):
+                    continue
+                if not hasattr(ds, 'Rows') or not hasattr(ds, 'Columns'):
+                    continue
+                
+                series_uid = str(ds.SeriesInstanceUID)
+                
+                if series_uid not in self._series_files:
+                    self._series_files[series_uid] = []
+                    series_headers[series_uid] = ds
+                    series_positions[series_uid] = []
+                
+                self._series_files[series_uid].append(file_path)
+                
+                try:
+                    z_pos = float(ds.ImagePositionPatient[2])
+                    series_positions[series_uid].append((z_pos, file_path))
+                except Exception:
+                    pass
+                
+            except Exception:
+                continue
+        
+        self._report_progress(num_dicom, num_dicom, "Building series list...")
+        
+        # Build series info list
+        series_list = []
+        for series_uid, file_paths in self._series_files.items():
+            if not file_paths:
+                continue
+            
+            ds = series_headers.get(series_uid)
+            if ds is None:
+                continue
+            
+            # Calculate thickness
+            thickness = 1.0
+            positions = series_positions.get(series_uid, [])
+            if len(positions) >= 2:
+                positions.sort(key=lambda x: x[0])
+                try:
+                    thickness = abs(positions[1][0] - positions[0][0])
+                    if thickness == 0:
+                        thickness = safe_float(getattr(ds, 'SliceThickness', None), 1.0)
+                except Exception:
+                    thickness = safe_float(getattr(ds, 'SliceThickness', None), 1.0)
+            else:
+                thickness = safe_float(getattr(ds, 'SliceThickness', None), 1.0)
+            
+            # Format study date
+            study_date = str(getattr(ds, 'StudyDate', ''))
+            if study_date and len(study_date) == 8:
+                study_date = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
+            
+            info = SeriesInfo(
+                series_instance_uid=series_uid,
+                series_number=safe_int(getattr(ds, 'SeriesNumber', None), 0),
+                series_description=str(getattr(ds, 'SeriesDescription', 'No Description')),
+                modality=str(getattr(ds, 'Modality', 'Unknown')),
+                num_slices=len(file_paths),
+                slice_thickness=thickness,
+                patient_name=str(getattr(ds, 'PatientName', '')),
+                patient_id=str(getattr(ds, 'PatientID', '')),
+                study_date=study_date,
+                study_description=str(getattr(ds, 'StudyDescription', '')),
+                file_paths=file_paths
+            )
+            series_list.append(info)
+            self._series_info[series_uid] = info
+        
+        series_list.sort(key=lambda s: (s.series_number, s.series_description))
+        return series_list
+    
+    def load_series(self, series_uid: str) -> bool:
+        """Load a specific series by its UID (after scanning)."""
+        if series_uid not in self._series_files:
+            return False
+        
+        file_paths = self._series_files[series_uid]
+        if not file_paths:
+            return False
+        
+        total = len(file_paths)
+        self._report_progress(0, total, f"Loading {total} slices...")
+        
+        datasets = []
+        for i, file_path in enumerate(file_paths):
+            if i % 20 == 0:
+                self._report_progress(i, total, f"Loading slice {i}/{total}...")
+            try:
+                ds = pydicom.dcmread(file_path, force=True)
+                if hasattr(ds, 'PixelData') and hasattr(ds, 'ImagePositionPatient'):
+                    datasets.append(ds)
+            except Exception:
+                continue
+        
+        if not datasets:
+            return False
+        
+        self._report_progress(total, total, "Sorting slices...")
+        
+        try:
+            # First sort by instance number to have some determinism
+            datasets.sort(key=lambda s: int(getattr(s, 'InstanceNumber', 0)))
+            
+            # Check for multiple phases (duplicates at same Z position)
+            # This handles 4D data (Cardiac phases) loaded as one series
+            z_map = {}
+            for ds in datasets:
+                z = get_z_position(ds)
+                if z not in z_map:
+                    z_map[z] = []
+                z_map[z].append(ds)
+            
+            num_unique_z = len(z_map)
+            
+            # If we have significantly more files than unique Z positions, it's likely 4D
+            if len(datasets) > num_unique_z * 1.05:  # 5% buffer for overlap errors
+                print(f"4D Data Detected: {len(datasets)} slices vs {num_unique_z} unique positions.")
+                
+                selected_datasets = []
+                
+                # Check for TemporalPositionIdentifier (0020,0100)
+                phases = {}
+                for ds in datasets:
+                    phase_id = getattr(ds, 'TemporalPositionIdentifier', None)
+                    if phase_id is not None:
+                        if phase_id not in phases: phases[phase_id] = []
+                        phases[phase_id].append(ds)
+                
+                if phases:
+                    # Pick phase with most slices (likely complete volume)
+                    best_phase = max(phases.keys(), key=lambda k: len(phases[k]))
+                    print(f"Selecting TemporalPhase {best_phase} ({len(phases[best_phase])} slices)")
+                    selected_datasets = phases[best_phase]
+                else:
+                    # Try TriggerTime (0018,1060)
+                    times = {}
+                    for ds in datasets:
+                        tt = float(getattr(ds, 'TriggerTime', 0))
+                        if tt not in times: times[tt] = []
+                        times[tt].append(ds)
+                    
+                    if len(times) > 1:
+                        # Pick timepoint with most slices
+                        best_time = max(times.keys(), key=lambda k: len(times[k]))
+                        print(f"Selecting TriggerTime {best_time} ({len(times[best_time])} slices)")
+                        selected_datasets = times[best_time]
+                    else:
+                        # Fallback: Just take first slice at each Z position
+                        print("No phase tags found. taking first slice per Z position.")
+                        selected_datasets = []
+                        for z in sorted(z_map.keys()):
+                            selected_datasets.append(z_map[z][0])
+                
+                datasets = selected_datasets
+
+            # Final sort by Z for volume construction
+            datasets.sort(key=lambda s: get_z_position(s))
+            
+        except Exception as e:
+            print(f"Error sorting 4D datasets: {e}")
+            datasets.sort(key=lambda s: int(getattr(s, 'InstanceNumber', 0)))
+        
+        self.slices = datasets
+        self._report_progress(total, total, "Extracting metadata...")
+        self._extract_metadata()
+        
+        self._report_progress(total, total, "Building volume...")
+        self._build_volume()
+        
+        return True
+    
+    def load_folder(self, folder_path: str, series_uid: Optional[str] = None) -> bool:
+        """Load DICOM files from folder."""
+        series_list = self.scan_folder(folder_path)
+        
+        if not series_list:
+            return False
+        
+        if series_uid:
+            return self.load_series(series_uid)
+        
+        return self.load_series(series_list[0].series_instance_uid)
+    
+    def _extract_metadata(self):
+        """Extract metadata from the first slice."""
+        if not self.slices:
+            return
+        
+        ds = self.slices[0]
+        
+        self.study_instance_uid = str(getattr(ds, 'StudyInstanceUID', ''))
+        self.series_instance_uid = str(getattr(ds, 'SeriesInstanceUID', ''))
+        self.frame_of_reference_uid = str(getattr(ds, 'FrameOfReferenceUID', ''))
+        
+        self.rows = int(getattr(ds, 'Rows', 512))
+        self.cols = int(getattr(ds, 'Columns', 512))
+        
+        # Handle PixelSpacing which may be MultiValue
+        pixel_spacing = getattr(ds, 'PixelSpacing', [1.0, 1.0])
+        ps_list = [safe_float(x, 1.0) for x in pixel_spacing] if hasattr(pixel_spacing, '__iter__') else [1.0, 1.0]
+        if len(ps_list) < 2:
+            ps_list = [1.0, 1.0]
+        
+        slice_thickness = safe_float(getattr(ds, 'SliceThickness', 1.0), 1.0)
+        
+        if len(self.slices) > 1:
+            pos1_z = get_z_position(self.slices[0])
+            pos2_z = get_z_position(self.slices[1])
+            slice_spacing = abs(pos2_z - pos1_z)
+            if slice_spacing == 0:
+                slice_spacing = slice_thickness
+        else:
+            slice_spacing = slice_thickness
+        
+        self.spacing = (ps_list[1], ps_list[0], slice_spacing)
+        
+        # Handle ImagePositionPatient which may be MultiValue
+        ipp = getattr(ds, 'ImagePositionPatient', [0, 0, 0])
+        ipp_list = [safe_float(x, 0.0) for x in ipp] if hasattr(ipp, '__iter__') else [0.0, 0.0, 0.0]
+        if len(ipp_list) < 3:
+            ipp_list = [0.0, 0.0, 0.0]
+        self.origin = (ipp_list[0], ipp_list[1], ipp_list[2])
+        
+        # Handle ImageOrientationPatient which may be MultiValue
+        iop = getattr(ds, 'ImageOrientationPatient', [1, 0, 0, 0, 1, 0])
+        iop_list = [safe_float(x, 0.0) for x in iop] if hasattr(iop, '__iter__') else [1, 0, 0, 0, 1, 0]
+        if len(iop_list) < 6:
+            iop_list = [1, 0, 0, 0, 1, 0]
+        row_dir = np.array(iop_list[:3])
+        col_dir = np.array(iop_list[3:])
+        normal = np.cross(row_dir, col_dir)
+        self.orientation = np.column_stack([row_dir, col_dir, normal])
+        
+        # Handle window settings which may be MultiValue
+        self.window_center = safe_float(getattr(ds, 'WindowCenter', 40), 40.0)
+        self.window_width = safe_float(getattr(ds, 'WindowWidth', 400), 400.0)
+        
+        self.patient_info = PatientInfo(
+            patient_id=str(getattr(ds, 'PatientID', '')),
+            patient_number=str(getattr(ds, 'PatientID', '')),
+            gender=str(getattr(ds, 'PatientSex', '')),
+            age=str(getattr(ds, 'PatientAge', '')),
+            height=str(getattr(ds, 'PatientSize', '')),
+            weight=str(getattr(ds, 'PatientWeight', ''))
+        )
+        
+        study_date = str(getattr(ds, 'StudyDate', ''))
+        if study_date and len(study_date) == 8:
+            study_date = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
+        
+        self.study_info = StudyInfo(
+            scan_date=study_date,
+            site_name=str(getattr(ds, 'InstitutionName', '')),
+            pi_name=str(getattr(ds, 'ReferringPhysicianName', ''))
+        )
+    
+    def _build_volume(self):
+        """Build the 3D volume array from loaded slices."""
+        if not self.slices:
+            return
+        
+        num_slices = len(self.slices)
+        volume = np.zeros((num_slices, self.rows, self.cols), dtype=np.int16)
+        
+        for i, ds in enumerate(self.slices):
+            if i % 50 == 0:
+                self._report_progress(i, num_slices, f"Building volume... {i}/{num_slices}")
+            
+            try:
+                pixel_array = ds.pixel_array
+                slope = safe_float(getattr(ds, 'RescaleSlope', None), 1.0)
+                intercept = safe_float(getattr(ds, 'RescaleIntercept', None), 0.0)
+                pixel_array = pixel_array.astype(np.float32) * slope + intercept
+                volume[i] = pixel_array.astype(np.int16)
+            except Exception as e:
+                print(f"Error processing slice {i}: {e}")
+                continue
+        
+        self.volume = volume
+        print(f"Volume built: shape={volume.shape}, min={volume.min()}, max={volume.max()}")
+    
+    def get_volume_dimensions(self) -> Tuple[int, int, int]:
+        if self.volume is None:
+            return (0, 0, 0)
+        return self.volume.shape
+    
+    def get_volume_extent_mm(self) -> Tuple[float, float, float]:
+        dims = self.get_volume_dimensions()
+        return (
+            dims[2] * self.spacing[0],
+            dims[1] * self.spacing[1],
+            dims[0] * self.spacing[2]
+        )
+    
+    def index_to_patient(self, i: int, j: int, k: int) -> Tuple[float, float, float]:
+        local = np.array([k * self.spacing[0], j * self.spacing[1], i * self.spacing[2]])
+        patient = self.orientation @ local + np.array(self.origin)
+        return (float(patient[0]), float(patient[1]), float(patient[2]))
+    
+    def patient_to_index(self, x: float, y: float, z: float) -> Tuple[int, int, int]:
+        patient = np.array([x, y, z])
+        local = np.linalg.inv(self.orientation) @ (patient - np.array(self.origin))
+        k = int(round(local[0] / self.spacing[0]))
+        j = int(round(local[1] / self.spacing[1]))
+        i = int(round(local[2] / self.spacing[2]))
+        return (i, j, k)
+    
+    def get_axial_slice(self, z_index: int) -> Optional[np.ndarray]:
+        if self.volume is None or z_index < 0 or z_index >= self.volume.shape[0]:
+            return None
+        return self.volume[z_index, :, :]
+    
+    def get_sagittal_slice(self, x_index: int) -> Optional[np.ndarray]:
+        """Get sagittal slice with proper aspect ratio."""
+        if self.volume is None or x_index < 0 or x_index >= self.volume.shape[2]:
+            return None
+        
+        # Get the raw slice (Z, Y) shape
+        raw_slice = self.volume[:, :, x_index]
+        
+        # Resample Z axis to match physical aspect ratio with Y
+        # Physical Z extent = num_z * z_spacing
+        # Physical Y extent = num_y * y_spacing
+        # For proper display, resample Z to have same mm/pixel as Y
+        num_z, num_y = raw_slice.shape
+        z_spacing = self.spacing[2]  # mm per Z slice
+        y_spacing = self.spacing[0]  # mm per Y pixel
+        
+        if z_spacing > 0 and y_spacing > 0:
+            # Target: same physical size as axial (approximately square)
+            # Resample Z to have same mm/pixel as Y
+            target_z = int(num_z * z_spacing / y_spacing)
+            if target_z > 0 and target_z != num_z:
+                from scipy.ndimage import zoom
+                scale = target_z / num_z
+                raw_slice = zoom(raw_slice, (scale, 1.0), order=1)
+        
+        return raw_slice
+    
+    def get_coronal_slice(self, y_index: int) -> Optional[np.ndarray]:
+        """Get coronal slice with proper aspect ratio."""
+        if self.volume is None or y_index < 0 or y_index >= self.volume.shape[1]:
+            return None
+        
+        # Get the raw slice (Z, X) shape
+        raw_slice = self.volume[:, y_index, :]
+        
+        # Resample Z axis to match physical aspect ratio with X
+        num_z, num_x = raw_slice.shape
+        z_spacing = self.spacing[2]  # mm per Z slice
+        x_spacing = self.spacing[1]  # mm per X pixel
+        
+        if z_spacing > 0 and x_spacing > 0:
+            # Target: same physical size as axial (approximately square)
+            target_z = int(num_z * z_spacing / x_spacing)
+            if target_z > 0 and target_z != num_z:
+                from scipy.ndimage import zoom
+                scale = target_z / num_z
+                raw_slice = zoom(raw_slice, (scale, 1.0), order=1)
+        
+        return raw_slice
+    
+    def get_oblique_slice(self, center: np.ndarray, normal: np.ndarray, 
+                          up: np.ndarray, size: int = 512) -> Optional[np.ndarray]:
+        """
+        Extract an oblique slice from the volume at an arbitrary plane.
+        
+        Args:
+            center: 3D point in voxel coordinates (z, y, x) - center of the slice
+            normal: Normal vector of the plane (defines viewing direction)
+            up: Up vector of the plane (defines which way is "up" in the slice)
+            size: Output slice size (square)
+            
+        Returns:
+            2D numpy array of the extracted slice, or None if volume not loaded
+        """
+        if self.volume is None:
+            return None
+        
+        from scipy.ndimage import map_coordinates
+        
+        # Normalize vectors
+        normal = normal / np.linalg.norm(normal)
+        up = up / np.linalg.norm(up)
+        
+        # Compute right vector (perpendicular to both)
+        right = np.cross(normal, up)
+        right = right / np.linalg.norm(right)
+        
+        # Recompute up to ensure orthogonality
+        up = np.cross(right, normal)
+        up = up / np.linalg.norm(up)
+        
+        # Create sampling grid
+        # Sample at native resolution - use smallest spacing
+        sample_spacing = min(self.spacing)
+        half_size = size // 2
+        
+        # Create 2D grid of points on the plane
+        u = np.linspace(-half_size, half_size, size) * sample_spacing / min(self.spacing)
+        v = np.linspace(-half_size, half_size, size) * sample_spacing / min(self.spacing)
+        uu, vv = np.meshgrid(u, v)
+        
+        # Convert plane coordinates to 3D voxel coordinates
+        # Points on plane: center + u*right + v*up
+        coords_z = center[0] + uu * right[0] + vv * up[0]
+        coords_y = center[1] + uu * right[1] + vv * up[1]
+        coords_x = center[2] + uu * right[2] + vv * up[2]
+        
+        # Stack coordinates for map_coordinates: (3, size, size)
+        coords = np.array([coords_z, coords_y, coords_x])
+        
+        # Sample the volume using trilinear interpolation
+        # mode='constant' pads with cval outside volume bounds
+        oblique_slice = map_coordinates(
+            self.volume.astype(np.float32), 
+            coords, 
+            order=1,  # Linear interpolation
+            mode='constant', 
+            cval=-1024  # Air HU for out-of-bounds
+        )
+        
+        return oblique_slice.astype(np.int16)
+    
+    def apply_window(self, image: np.ndarray, 
+                     window_center: Optional[float] = None,
+                     window_width: Optional[float] = None) -> np.ndarray:
+        wc = window_center if window_center is not None else self.window_center
+        ww = window_width if window_width is not None else self.window_width
+        
+        # Ensure valid window width
+        if ww <= 0:
+            ww = 400.0
+        
+        min_val = wc - ww / 2
+        max_val = wc + ww / 2
+        
+        clipped = np.clip(image, min_val, max_val)
+        
+        # Prevent division by zero
+        if max_val == min_val:
+            return np.zeros(image.shape, dtype=np.uint8)
+        
+        scaled = ((clipped - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        
+        return scaled

@@ -1,0 +1,17 @@
+# Core dependencies
+PySide6>=6.6.0
+vtk>=9.3.0
+pydicom>=2.4.0
+numpy>=1.26.0
+
+# PDF generation
+reportlab>=4.0.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Utilities
+uuid
+
+# Testing
+pytest>=7.4.0

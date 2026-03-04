@@ -7,11 +7,11 @@ numpy>=1.26.0
 # PDF generation
 reportlab>=4.0.0
 
+# Scientific computing
+scipy>=1.11.0
+
 # Image processing
 Pillow>=10.0.0
-
-# Utilities
-uuid
 
 # Testing
 pytest>=7.4.0

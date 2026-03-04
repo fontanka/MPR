@@ -497,6 +497,11 @@ class MPRViewer(QWidget):
             vp.show_crosshair = visible
             vp.update()
 
+    def set_locked_rotation(self, locked: bool):
+        """Set locked rotation mode (90° between axes) for all viewports."""
+        for vp in self._viewports():
+            vp.locked_rotation = locked
+
     @property
     def selected_measurement(self) -> Optional[Measurement]:
         """Get the currently selected measurement from active viewport."""

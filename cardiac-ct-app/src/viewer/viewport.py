@@ -143,6 +143,8 @@ class ViewportWidget(QWidget):
         self.arm_rotate_center_screen: Optional[QPoint] = None
         self.arm_rotate_start_angle_screen: float = 0.0
         self.arm_rotate_initial_plane: Optional[ViewPlane] = None
+        self.arm_rotate_initial_other_plane: Optional[ViewPlane] = None  # for locked rotation
+        self.locked_rotation: bool = True  # RadiAnt-style: maintain 90° between axes
 
         # Polygon points for polygon tool
         self.polygon_points: List[Point3D] = []
@@ -1232,6 +1234,12 @@ class ViewportWidget(QWidget):
         other_plane = self.mpr_state.planes[arm_orient]
         self.arm_rotate_initial_plane = other_plane.copy()
 
+        # For locked rotation: also capture the third plane's initial state
+        all_orientations = set(self.mpr_state.planes.keys())
+        third_orient = (all_orientations - {self.orientation, arm_orient}).pop()
+        self.arm_rotate_initial_other_plane = self.mpr_state.planes[third_orient].copy()
+        self._arm_rotate_third_orient = third_orient
+
         # Compute center of intersection on screen
         center = self._get_intersection_screen_pos()
         if center:
@@ -1294,6 +1302,19 @@ class ViewportWidget(QWidget):
             )
 
             self.arm_rotated.emit(self.rotating_arm, new_plane)
+
+            # Locked rotation: also rotate the third plane to maintain 90° between axes
+            if self.locked_rotation and self.arm_rotate_initial_other_plane:
+                init3 = self.arm_rotate_initial_other_plane
+                new_col3 = rotate_vector(init3.col_dir, my_normal, delta_angle)
+                new_row3 = rotate_vector(init3.row_dir, my_normal, delta_angle)
+                new_plane3 = ViewPlane(
+                    origin=self.mpr_state.intersection_point.copy(),
+                    col_dir=new_col3 / np.linalg.norm(new_col3),
+                    row_dir=new_row3 / np.linalg.norm(new_row3)
+                )
+                self.arm_rotated.emit(self._arm_rotate_third_orient, new_plane3)
+
             return
 
         # Update cursor and hover state — only repaint if hover changed

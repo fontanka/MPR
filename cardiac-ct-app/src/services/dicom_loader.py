@@ -571,68 +571,6 @@ class DICOMLoader:
         
         return raw_slice
     
-    def get_oblique_slice(self, center: np.ndarray, normal: np.ndarray, 
-                          up: np.ndarray, size: int = 512) -> Optional[np.ndarray]:
-        """
-        Extract an oblique slice from the volume at an arbitrary plane.
-        
-        Args:
-            center: 3D point in voxel coordinates (z, y, x) - center of the slice
-            normal: Normal vector of the plane (defines viewing direction)
-            up: Up vector of the plane (defines which way is "up" in the slice)
-            size: Output slice size (square)
-            
-        Returns:
-            2D numpy array of the extracted slice, or None if volume not loaded
-        """
-        if self.volume is None:
-            return None
-        
-        from scipy.ndimage import map_coordinates
-        
-        # Normalize vectors
-        normal = normal / np.linalg.norm(normal)
-        up = up / np.linalg.norm(up)
-        
-        # Compute right vector (perpendicular to both)
-        right = np.cross(normal, up)
-        right = right / np.linalg.norm(right)
-        
-        # Recompute up to ensure orthogonality
-        up = np.cross(right, normal)
-        up = up / np.linalg.norm(up)
-        
-        # Create sampling grid
-        # Sample at native resolution - use smallest spacing
-        sample_spacing = min(self.spacing)
-        half_size = size // 2
-        
-        # Create 2D grid of points on the plane
-        u = np.linspace(-half_size, half_size, size) * sample_spacing / min(self.spacing)
-        v = np.linspace(-half_size, half_size, size) * sample_spacing / min(self.spacing)
-        uu, vv = np.meshgrid(u, v)
-        
-        # Convert plane coordinates to 3D voxel coordinates
-        # Points on plane: center + u*right + v*up
-        coords_z = center[0] + uu * right[0] + vv * up[0]
-        coords_y = center[1] + uu * right[1] + vv * up[1]
-        coords_x = center[2] + uu * right[2] + vv * up[2]
-        
-        # Stack coordinates for map_coordinates: (3, size, size)
-        coords = np.array([coords_z, coords_y, coords_x])
-        
-        # Sample the volume using trilinear interpolation
-        # mode='constant' pads with cval outside volume bounds
-        oblique_slice = map_coordinates(
-            self.volume.astype(np.float32), 
-            coords, 
-            order=1,  # Linear interpolation
-            mode='constant', 
-            cval=-1024  # Air HU for out-of-bounds
-        )
-        
-        return oblique_slice.astype(np.int16)
-    
     def get_oblique_slice_patient(self, center_patient: np.ndarray,
                                   col_dir: np.ndarray, row_dir: np.ndarray,
                                   col_count: int = 0, row_count: int = 0

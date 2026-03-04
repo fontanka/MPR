@@ -171,6 +171,19 @@ class ViewportWidget(QWidget):
         self._oblique_col_count: int = 0
         self._oblique_row_count: int = 0
 
+        # Cached pixmap (avoid QPixmap.fromImage every paint)
+        self._cached_pixmap: Optional[QPixmap] = None
+
+        # Window/level drag state
+        self._wl_dragging: bool = False
+        self._wl_start_pos: Optional[QPoint] = None
+        self._wl_start_center: float = 0.0
+        self._wl_start_width: float = 0.0
+
+        # Hover state for smart repainting
+        self._hover_arm: Optional[str] = None
+        self._hover_intersection: bool = False
+
         # Setup UI
         self._setup_ui()
 
@@ -354,6 +367,7 @@ class ViewportWidget(QWidget):
         h, w = display_data.shape
         bytes_data = display_data.tobytes()
         self.display_image = QImage(bytes_data, w, h, w, QImage.Format_Grayscale8).copy()
+        self._cached_pixmap = QPixmap.fromImage(self.display_image)
 
         oblique_indicator = " ◇" if self._is_oblique() else ""
         self.slice_label.setText(
@@ -446,52 +460,6 @@ class ViewportWidget(QWidget):
 
         return Point3D(x, y, z)
 
-    def _patient_to_screen(self, point: Point3D) -> QPoint:
-        """Convert patient coordinates to screen coordinates."""
-        if not self.loader or self.display_image is None:
-            return QPoint(0, 0)
-
-        frame_rect = self.image_frame.rect()
-        img_w = self.display_image.width()
-        img_h = self.display_image.height()
-
-        scale_x = frame_rect.width() / img_w
-        scale_y = frame_rect.height() / img_h
-        scale = min(scale_x, scale_y) * self.zoom
-
-        img_display_w = img_w * scale
-        img_display_h = img_h * scale
-        offset_x = (frame_rect.width() - img_display_w) / 2 + self.pan_offset.x()
-        offset_y = (frame_rect.height() - img_display_h) / 2 + self.pan_offset.y()
-
-        # Oblique: use view_plane basis vectors
-        if self._is_oblique() and self.view_plane:
-            px_sp = self._oblique_pixel_spacing
-            col_count = self._oblique_col_count
-            row_count = self._oblique_row_count
-            p = np.array([point.x, point.y, point.z])
-            delta = p - self.view_plane.origin
-            img_x = np.dot(delta, self.view_plane.col_dir) / px_sp + col_count / 2.0
-            img_y = np.dot(delta, self.view_plane.row_dir) / px_sp + row_count / 2.0
-        else:
-            spacing = self.loader.spacing
-            origin = self.loader.origin
-
-            if self.orientation == 'axial':
-                img_x = (point.x - origin[0]) / spacing[0]
-                img_y = (point.y - origin[1]) / spacing[1]
-            elif self.orientation == 'sagittal':
-                img_x = (point.y - origin[1]) / spacing[1]
-                img_y = self.display_image.height() - (point.z - origin[2]) / spacing[2]
-            else:  # coronal
-                img_x = (point.x - origin[0]) / spacing[0]
-                img_y = self.display_image.height() - (point.z - origin[2]) / spacing[2]
-
-        screen_x = offset_x + img_x * scale + self.image_frame.x()
-        screen_y = offset_y + img_y * scale + self.image_frame.y()
-
-        return QPoint(int(screen_x), int(screen_y))
-
     def _patient_to_screen_f(self, patient_pt: np.ndarray) -> Tuple[float, float]:
         """Convert patient 3D point to screen coordinates (float precision)."""
         if not self.loader or self.display_image is None:
@@ -534,6 +502,11 @@ class ViewportWidget(QWidget):
         sx = offset_x + img_x * scale + self.image_frame.x()
         sy = offset_y + img_y * scale + self.image_frame.y()
         return (sx, sy)
+
+    def _patient_to_screen(self, point: Point3D) -> QPoint:
+        """Convert patient coordinates to screen coordinates."""
+        sx, sy = self._patient_to_screen_f(np.array([point.x, point.y, point.z]))
+        return QPoint(int(sx), int(sy))
 
     def _screen_to_patient_3d(self, screen_pos: QPoint) -> np.ndarray:
         """Convert screen position to 3D patient coordinates on this viewport's plane."""
@@ -583,9 +556,8 @@ class ViewportWidget(QWidget):
 
             # Draw Image
             painter.fillRect(dest_rect, QColor(0, 0, 0))
-            pixmap = QPixmap.fromImage(self.display_image)
-            if not pixmap.isNull():
-                painter.drawPixmap(dest_rect, pixmap)
+            if self._cached_pixmap and not self._cached_pixmap.isNull():
+                painter.drawPixmap(dest_rect, self._cached_pixmap)
 
             # Draw crosshair
             if self.show_crosshair:
@@ -1159,6 +1131,16 @@ class ViewportWidget(QWidget):
             event.accept()
             return
 
+        # Right mouse button = Window/Level adjustment
+        if event.button() == Qt.RightButton:
+            self._wl_dragging = True
+            self._wl_start_pos = event.pos()
+            self._wl_start_center = self.window_center
+            self._wl_start_width = self.window_width
+            self.setCursor(Qt.SizeAllCursor)
+            event.accept()
+            return
+
         if event.button() != Qt.LeftButton:
             return
 
@@ -1269,6 +1251,15 @@ class ViewportWidget(QWidget):
             self.update()
             return
 
+        # Handle window/level drag
+        if self._wl_dragging and self._wl_start_pos:
+            dx = event.pos().x() - self._wl_start_pos.x()
+            dy = event.pos().y() - self._wl_start_pos.y()
+            self.window_width = max(1.0, self._wl_start_width + dx * 2.0)
+            self.window_center = self._wl_start_center - dy * 2.0
+            self._update_display()
+            return
+
         # Handle intersection dragging
         if self.dragging_intersection and self.mpr_state and self.view_plane:
             new_3d = self._screen_to_patient_3d(event.pos())
@@ -1282,7 +1273,6 @@ class ViewportWidget(QWidget):
             current_angle = math.atan2(dy, dx)
             delta_angle = current_angle - self.arm_rotate_start_angle_screen
 
-            # Rotate the linked plane's col_dir and row_dir around this viewport's normal
             my_normal = self.view_plane.normal
             init = self.arm_rotate_initial_plane
             new_col_dir = rotate_vector(init.col_dir, my_normal, delta_angle)
@@ -1297,23 +1287,37 @@ class ViewportWidget(QWidget):
             self.arm_rotated.emit(self.rotating_arm, new_plane)
             return
 
-        # Update cursor based on what's under the mouse
-        if not self.measuring and not self.selected_measurement:
+        # Update cursor and hover state — only repaint if hover changed
+        needs_repaint = False
+        if not self.measuring and not self.selected_measurement and not self.drag_handle:
+            old_hover_arm = self._hover_arm
+            old_hover_int = self._hover_intersection
+
             if self.mpr_state and self.view_plane:
-                if self._is_near_intersection_center(event.pos()):
-                    self.setCursor(Qt.SizeAllCursor)
-                elif self._find_arm_at_pos(event.pos()):
-                    self.setCursor(Qt.SizeAllCursor)
+                self._hover_intersection = self._is_near_intersection_center(event.pos())
+                if self._hover_intersection:
+                    self._hover_arm = None
+                    self.setCursor(Qt.OpenHandCursor)
                 else:
-                    self.setCursor(Qt.ArrowCursor)
+                    self._hover_arm = self._find_arm_at_pos(event.pos())
+                    if self._hover_arm:
+                        self.setCursor(Qt.CrossCursor)
+                    elif self.active_tool:
+                        self.setCursor(Qt.CrossCursor)
+                    else:
+                        self.setCursor(Qt.ArrowCursor)
             else:
-                self.setCursor(Qt.ArrowCursor)
+                self._hover_intersection = False
+                self._hover_arm = None
+                self.setCursor(Qt.CrossCursor if self.active_tool else Qt.ArrowCursor)
+
+            if old_hover_arm != self._hover_arm or old_hover_int != self._hover_intersection:
+                needs_repaint = True
 
         if self.measuring:
             self.measure_end = event.pos()
             self.update()
         elif self.selected_measurement and self.drag_handle and self.drag_start_pos:
-            # Handle editing
             current_pt_pat = self._screen_to_patient(event.pos())
             m = self.selected_measurement
 
@@ -1338,7 +1342,6 @@ class ViewportWidget(QWidget):
                 except (ValueError, IndexError):
                     pass
 
-            # Recalculate value
             if m.type == 'polygon' and len(m.points) >= 3:
                 perimeter = 0
                 for i in range(len(m.points)):
@@ -1351,9 +1354,8 @@ class ViewportWidget(QWidget):
 
             self.update()
             self.measurement_modified.emit(m)
-
-        # Need to repaint for cursor-near-arm highlighting
-        self.update()
+        elif needs_repaint:
+            self.update()
 
         super().mouseMoveEvent(event)
 
@@ -1366,6 +1368,10 @@ class ViewportWidget(QWidget):
             return
 
         if self.active_tool == 'polygon' and self.measuring and self.polygon_points:
+            # Double-click fires mousePressEvent first (adding a spurious point), remove it
+            if len(self.polygon_points) > 1:
+                self.polygon_points.pop()
+
             if len(self.polygon_points) >= 3:
                 perimeter = 0.0
                 pts = self.polygon_points
@@ -1374,7 +1380,7 @@ class ViewportWidget(QWidget):
                      p2 = pts[(i+1) % len(pts)]
                      perimeter += calculate_length(p1, p2)
 
-                diameter = perimeter / 3.14159
+                diameter = perimeter / math.pi
                 self.polygon_created.emit(self.orientation, self.polygon_points, diameter)
 
             self.measuring = False
@@ -1389,6 +1395,14 @@ class ViewportWidget(QWidget):
         if event.button() == Qt.MiddleButton:
             self.panning = False
             self.pan_start_pos = None
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+
+        # End window/level drag
+        if event.button() == Qt.RightButton and self._wl_dragging:
+            self._wl_dragging = False
+            self._wl_start_pos = None
             self.setCursor(Qt.ArrowCursor)
             event.accept()
             return

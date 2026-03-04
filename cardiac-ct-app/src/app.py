@@ -365,9 +365,7 @@ class MainWindow(QMainWindow):
         self.polygon_action.setCheckable(True)
         self.polygon_action.triggered.connect(lambda: self._set_tool('polygon'))
         toolbar.addAction(self.polygon_action)
-        
-        toolbar.addAction(self.polygon_action)
-        
+
         self.auto_axes_action = QAction("Auto Axes", self)
         self.auto_axes_action.setCheckable(True)
         self.auto_axes_action.triggered.connect(self._on_auto_axes_toggled)
@@ -433,7 +431,6 @@ class MainWindow(QMainWindow):
         
         # MPR viewer signals
         self.mpr_viewer.measurement_added.connect(self._on_measurement_added)
-        self.mpr_viewer.measurement_modified.connect(self._on_measurement_modified)
         self.mpr_viewer.measurement_modified.connect(self._on_measurement_modified)
         self.mpr_viewer.measurement_deleted.connect(self._on_measurement_deleted)
         self.mpr_viewer.measurement_assigned.connect(self._on_measurement_assigned)

@@ -73,6 +73,8 @@ def is_measurement_visible(measurement: Measurement,
     Returns:
         True if the measurement should be visible
     """
+    if not measurement.points:
+        return False
     for point in measurement.points:
         dist = abs(distance_to_plane(point, current_plane))
         if dist > tolerance:

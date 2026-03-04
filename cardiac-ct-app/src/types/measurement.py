@@ -97,7 +97,6 @@ class Measurement:
             "value": self.value,
             "timestamp": self.timestamp,
             "userId": self.user_id,
-            "userId": self.user_id,
             "screenshotPath": self.screenshot_path,
             "label_position": self.label_position.to_dict() if self.label_position else None,
             "show_axes": self.show_axes

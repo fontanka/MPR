@@ -240,6 +240,7 @@ class MainWindow(QMainWindow):
         
         self.loader: Optional[DICOMLoader] = None
         self.measurement_service: Optional[MeasurementService] = None
+        self.selected_measurement_candidate = None
         self.current_study_path: Optional[str] = None
         
         self.setWindowTitle("Cardiac CT Measurements")
@@ -435,7 +436,23 @@ class MainWindow(QMainWindow):
         self.mpr_viewer.measurement_deleted.connect(self._on_measurement_deleted)
         self.mpr_viewer.measurement_assigned.connect(self._on_measurement_assigned)
         self.mpr_viewer.measurement_selected.connect(self._on_measurement_selected)
-    
+        self.mpr_viewer.window_level_changed.connect(self._on_window_level_changed_from_viewer)
+
+    def _on_window_level_changed_from_viewer(self, center: float, width: float):
+        """Sync W/L sliders when viewport drag changes window/level."""
+        self.wc_spin.blockSignals(True)
+        self.ww_spin.blockSignals(True)
+        self.wc_slider.blockSignals(True)
+        self.ww_slider.blockSignals(True)
+        self.wc_spin.setValue(int(center))
+        self.ww_spin.setValue(int(width))
+        self.wc_slider.setValue(int(center))
+        self.ww_slider.setValue(int(width))
+        self.wc_spin.blockSignals(False)
+        self.ww_spin.blockSignals(False)
+        self.wc_slider.blockSignals(False)
+        self.ww_slider.blockSignals(False)
+
     def _apply_dark_theme(self):
         """Apply dark theme to the application."""
         self.setStyleSheet("""
@@ -822,6 +839,8 @@ class MainWindow(QMainWindow):
     
     def _on_auto_axes_toggled(self, checked: bool):
         """Toggle auto axes for selected measurement."""
+        if not self.measurement_service:
+            return
         m = self.mpr_viewer.selected_measurement
         if m and m.type == 'polygon':
             m.show_axes = checked

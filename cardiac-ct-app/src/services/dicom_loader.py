@@ -33,7 +33,8 @@ def safe_float(value, default: float = 0.0) -> float:
     try:
         # If it's a MultiValue or list, get first element
         if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
-            value = list(value)[0] if len(list(value)) > 0 else default
+            items = list(value)
+            value = items[0] if items else default
         return float(value)
     except (ValueError, TypeError, IndexError):
         return default
@@ -44,7 +45,6 @@ def get_z_position(ds) -> float:
     try:
         ipp = ds.ImagePositionPatient
         if hasattr(ipp, '__iter__'):
-            # Convert to list to handle MultiValue
             ipp_list = [safe_float(x) for x in ipp]
             return ipp_list[2] if len(ipp_list) > 2 else 0.0
         return safe_float(ipp)
@@ -58,7 +58,8 @@ def safe_int(value, default: int = 0) -> int:
         return default
     try:
         if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
-            value = list(value)[0] if len(list(value)) > 0 else default
+            items = list(value)
+            value = items[0] if items else default
         return int(float(value))  # int(float()) handles decimal strings
     except (ValueError, TypeError, IndexError):
         return default
@@ -482,7 +483,7 @@ class DICOMLoader:
                 slope = safe_float(getattr(ds, 'RescaleSlope', None), 1.0)
                 intercept = safe_float(getattr(ds, 'RescaleIntercept', None), 0.0)
                 pixel_array = pixel_array.astype(np.float32) * slope + intercept
-                volume[i] = pixel_array.astype(np.int16)
+                volume[i] = np.clip(pixel_array, -32768, 32767).astype(np.int16)
             except Exception as e:
                 print(f"Error processing slice {i}: {e}")
                 continue
@@ -535,11 +536,9 @@ class DICOMLoader:
         # For proper display, resample Z to have same mm/pixel as Y
         num_z, num_y = raw_slice.shape
         z_spacing = self.spacing[2]  # mm per Z slice
-        y_spacing = self.spacing[0]  # mm per Y pixel
-        
+        y_spacing = self.spacing[1]  # mm per Y pixel (row_spacing)
+
         if z_spacing > 0 and y_spacing > 0:
-            # Target: same physical size as axial (approximately square)
-            # Resample Z to have same mm/pixel as Y
             target_z = int(num_z * z_spacing / y_spacing)
             if target_z > 0 and target_z != num_z:
                 from scipy.ndimage import zoom
@@ -559,10 +558,9 @@ class DICOMLoader:
         # Resample Z axis to match physical aspect ratio with X
         num_z, num_x = raw_slice.shape
         z_spacing = self.spacing[2]  # mm per Z slice
-        x_spacing = self.spacing[1]  # mm per X pixel
-        
+        x_spacing = self.spacing[0]  # mm per X pixel (col_spacing)
+
         if z_spacing > 0 and x_spacing > 0:
-            # Target: same physical size as axial (approximately square)
             target_z = int(num_z * z_spacing / x_spacing)
             if target_z > 0 and target_z != num_z:
                 from scipy.ndimage import zoom

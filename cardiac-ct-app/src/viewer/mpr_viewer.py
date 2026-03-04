@@ -35,7 +35,8 @@ class MPRViewer(QWidget):
     measurement_modified = Signal(Measurement)
     measurement_deleted = Signal(Measurement)
     measurement_assigned = Signal(Measurement, str)
-    measurement_selected = Signal(Measurement)
+    measurement_selected = Signal(object)  # Measurement or None
+    window_level_changed = Signal(float, float)  # center, width
     slice_changed = Signal(str, int)  # orientation, slice_index
     polygon_created = Signal(str, list, float)
 
@@ -98,7 +99,8 @@ class MPRViewer(QWidget):
             vp.measurement_deleted.connect(self._on_measurement_deleted_from_viewport)
             vp.measurement_assigned.connect(self._on_measurement_assigned_from_viewport)
             vp.polygon_created.connect(self._on_polygon_created)
-            vp.measurement_selected.connect(self.measurement_selected.emit)
+            vp.measurement_selected.connect(lambda m, src=vp: self._on_measurement_selected_from_viewport(m, src))
+            vp.window_level_changed.connect(self._on_window_level_changed_from_viewport)
 
     def _viewports(self) -> List[ViewportWidget]:
         return [self.axial_viewport, self.sagittal_viewport, self.coronal_viewport]
@@ -338,6 +340,8 @@ class MPRViewer(QWidget):
 
     def _on_measurement_deleted_from_viewport(self, measurement: Measurement):
         """Handle measurement deletion from a viewport."""
+        if not self.measurement_service:
+            return
         self.measurement_service.delete_measurement(measurement.id)
         self._update_measurements_display()
         self.measurement_deleted.emit(measurement)
@@ -451,6 +455,23 @@ class MPRViewer(QWidget):
         """Set window/level for all viewports."""
         for vp in self._viewports():
             vp.set_window_level(center, width)
+
+    def _on_measurement_selected_from_viewport(self, measurement, source_viewport):
+        """Handle measurement selection — deselect in other viewports."""
+        for vp in self._viewports():
+            if vp is not source_viewport and vp.selected_measurement:
+                vp.selected_measurement = None
+                vp.update()
+        self.measurement_selected.emit(measurement)
+
+    def _on_window_level_changed_from_viewport(self, center: float, width: float):
+        """Sync window/level from one viewport's drag to all viewports and app."""
+        for vp in self._viewports():
+            vp.window_center = center
+            vp.window_width = width
+            if vp.display_image is not None:
+                vp._update_display()
+        self.window_level_changed.emit(center, width)
 
     def delete_measurement(self, measurement_id: str):
         """Delete a measurement."""

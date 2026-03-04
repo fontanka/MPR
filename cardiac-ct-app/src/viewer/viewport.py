@@ -103,7 +103,8 @@ class ViewportWidget(QWidget):
     measurement_deleted = Signal(Measurement)
     measurement_assigned = Signal(Measurement, str)  # measurement, field_id
     polygon_created = Signal(str, list, float)  # orientation, points, value
-    measurement_selected = Signal(Measurement)
+    measurement_selected = Signal(object)  # Measurement or None
+    window_level_changed = Signal(float, float)  # center, width
 
     # Keep slice_changed for status bar
     slice_changed = Signal(str, int)  # orientation, slice_index
@@ -298,6 +299,9 @@ class ViewportWidget(QWidget):
         self.measuring = False
         self.measure_start = None
         self.measure_end = None
+        self.polygon_points = []
+        self.drag_handle = ""
+        self.setCursor(Qt.CrossCursor if tool else Qt.ArrowCursor)
         self.update()
 
     def _on_slider_changed(self, value: int):
@@ -317,6 +321,7 @@ class ViewportWidget(QWidget):
             delta_mm = (value - self.current_slice) * spacing[1]
 
         if abs(delta_mm) > 1e-6:
+            self.current_slice = value
             self.scroll_requested.emit(self.orientation, delta_mm)
 
     def _is_oblique(self) -> bool:
@@ -1131,14 +1136,12 @@ class ViewportWidget(QWidget):
             event.accept()
             return
 
-        # Right mouse button = Window/Level adjustment
+        # Right mouse button = Window/Level (on drag) or context menu (on click)
         if event.button() == Qt.RightButton:
-            self._wl_dragging = True
             self._wl_start_pos = event.pos()
             self._wl_start_center = self.window_center
             self._wl_start_width = self.window_width
-            self.setCursor(Qt.SizeAllCursor)
-            event.accept()
+            # Don't set _wl_dragging yet — wait for movement threshold
             return
 
         if event.button() != Qt.LeftButton:
@@ -1251,13 +1254,19 @@ class ViewportWidget(QWidget):
             self.update()
             return
 
-        # Handle window/level drag
-        if self._wl_dragging and self._wl_start_pos:
+        # Handle window/level drag (right button)
+        if self._wl_start_pos and event.buttons() & Qt.RightButton:
             dx = event.pos().x() - self._wl_start_pos.x()
             dy = event.pos().y() - self._wl_start_pos.y()
-            self.window_width = max(1.0, self._wl_start_width + dx * 2.0)
-            self.window_center = self._wl_start_center - dy * 2.0
-            self._update_display()
+            # Activate W/L drag only after movement threshold (5px)
+            if not self._wl_dragging and (abs(dx) > 5 or abs(dy) > 5):
+                self._wl_dragging = True
+                self.setCursor(Qt.SizeAllCursor)
+            if self._wl_dragging:
+                self.window_width = max(1.0, self._wl_start_width + dx * 2.0)
+                self.window_center = self._wl_start_center - dy * 2.0
+                self._update_display()
+                self.window_level_changed.emit(self.window_center, self.window_width)
             return
 
         # Handle intersection dragging
@@ -1359,14 +1368,18 @@ class ViewportWidget(QWidget):
 
         super().mouseMoveEvent(event)
 
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """Finish polygon on double click, or reset on right double-click."""
-        # Right double-click = Reset to standard axis-aligned planes
-        if event.button() == Qt.RightButton:
-            # This will be handled by MPRViewer's reset_oblique
-            event.accept()
-            return
+    def leaveEvent(self, event):
+        """Reset drag states when mouse leaves widget to prevent stuck states."""
+        if self._wl_dragging:
+            self._wl_dragging = False
+            self._wl_start_pos = None
+        self._hover_arm = None
+        self._hover_intersection = False
+        self.setCursor(Qt.ArrowCursor)
+        super().leaveEvent(event)
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """Finish polygon on double click."""
         if self.active_tool == 'polygon' and self.measuring and self.polygon_points:
             # Double-click fires mousePressEvent first (adding a spurious point), remove it
             if len(self.polygon_points) > 1:
@@ -1399,13 +1412,16 @@ class ViewportWidget(QWidget):
             event.accept()
             return
 
-        # End window/level drag
-        if event.button() == Qt.RightButton and self._wl_dragging:
+        # End window/level drag (or allow context menu if no drag occurred)
+        if event.button() == Qt.RightButton:
+            was_dragging = self._wl_dragging
             self._wl_dragging = False
             self._wl_start_pos = None
-            self.setCursor(Qt.ArrowCursor)
-            event.accept()
-            return
+            if was_dragging:
+                self.setCursor(Qt.ArrowCursor)
+                event.accept()
+                return
+            # No drag occurred — let Qt deliver contextMenuEvent
 
         if event.button() == Qt.LeftButton:
             # End intersection drag
@@ -1503,14 +1519,15 @@ class ViewportWidget(QWidget):
                  self.update()
 
         if self.selected_measurement:
+            # Capture current value — avoid stale lambda closure
+            m = self.selected_measurement
+            field = self.current_protocol_field
             menu = QMenu(self)
 
-            if self.current_protocol_field:
-                assign_action = QAction(f"Assign to: {self.current_protocol_field}", self)
+            if field:
+                assign_action = QAction(f"Assign to: {field}", self)
                 assign_action.triggered.connect(
-                    lambda: self.measurement_assigned.emit(
-                        self.selected_measurement, self.current_protocol_field
-                    )
+                    lambda _=False, _m=m, _f=field: self.measurement_assigned.emit(_m, _f)
                 )
                 menu.addAction(assign_action)
 
@@ -1518,7 +1535,11 @@ class ViewportWidget(QWidget):
 
             delete_action = QAction("Delete", self)
             delete_action.triggered.connect(
-                lambda: self.measurement_deleted.emit(self.selected_measurement)
+                lambda _=False, _m=m: (
+                    self.measurement_deleted.emit(_m),
+                    setattr(self, 'selected_measurement', None),
+                    self.measurement_selected.emit(None),
+                )
             )
             menu.addAction(delete_action)
 

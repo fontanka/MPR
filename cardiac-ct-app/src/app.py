@@ -380,7 +380,12 @@ class MainWindow(QMainWindow):
         self.crosshair_action.setChecked(True)  # On by default
         self.crosshair_action.triggered.connect(self._on_toggle_crosshairs)
         toolbar.addAction(self.crosshair_action)
-        
+
+        # Reset MPR to standard planes
+        reset_mpr_action = QAction("Reset MPR", self)
+        reset_mpr_action.triggered.connect(self._on_reset_mpr)
+        toolbar.addAction(reset_mpr_action)
+
         toolbar.addSeparator()
         
         # Edit study info
@@ -830,6 +835,11 @@ class MainWindow(QMainWindow):
     def _on_toggle_crosshairs(self, checked: bool):
         """Toggle crosshair visibility on all viewports."""
         self.mpr_viewer.set_crosshair_visible(checked)
+
+    def _on_reset_mpr(self):
+        """Reset all viewports to standard axis-aligned planes."""
+        self.mpr_viewer.reset_oblique()
+        self.statusbar.showMessage("MPR reset to standard planes", 3000)
 
     def _on_edit_study_info(self):
         """Open study info edit dialog."""

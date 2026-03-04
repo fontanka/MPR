@@ -2,18 +2,20 @@
 MPR Viewer Widget
 
 Tri-planar MPR viewer with synchronized crosshairs across axial, sagittal, and coronal views.
+Supports oblique MPR via axis arm rotation (RadiAnt-style).
 """
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QFrame
 )
 from PySide6.QtCore import Qt, Signal
 from typing import Optional, List
-from .viewport import ViewportWidget
+from .viewport import ViewportWidget, ViewPlane
 from ..services.dicom_loader import DICOMLoader
 from ..services.measurement_store import MeasurementService
 from ..services.coordinate_utils import calculate_length
 from ..types.measurement import Measurement, Point3D, PlaneDefinition
 import datetime
+import numpy as np
 
 
 class MPRViewer(QWidget):
@@ -85,32 +87,37 @@ class MPRViewer(QWidget):
         self.axial_viewport.slice_changed.connect(self._on_axial_slice_changed)
         self.sagittal_viewport.slice_changed.connect(self._on_sagittal_slice_changed)
         self.coronal_viewport.slice_changed.connect(self._on_coronal_slice_changed)
-        
+
+        # Plane rotation (oblique MPR)
+        self.axial_viewport.plane_rotated.connect(self._on_plane_rotated)
+        self.sagittal_viewport.plane_rotated.connect(self._on_plane_rotated)
+        self.coronal_viewport.plane_rotated.connect(self._on_plane_rotated)
+
         # Measurement creation
         self.axial_viewport.measurement_created.connect(self._on_measurement_created)
         self.sagittal_viewport.measurement_created.connect(self._on_measurement_created)
         self.coronal_viewport.measurement_created.connect(self._on_measurement_created)
-        
+
         # Measurement modification
         self.axial_viewport.measurement_modified.connect(self._on_measurement_modified_from_viewport)
         self.sagittal_viewport.measurement_modified.connect(self._on_measurement_modified_from_viewport)
         self.coronal_viewport.measurement_modified.connect(self._on_measurement_modified_from_viewport)
-        
+
         # Measurement deletion
         self.axial_viewport.measurement_deleted.connect(self._on_measurement_deleted_from_viewport)
         self.sagittal_viewport.measurement_deleted.connect(self._on_measurement_deleted_from_viewport)
         self.coronal_viewport.measurement_deleted.connect(self._on_measurement_deleted_from_viewport)
-        
+
         # Measurement assignment
         self.axial_viewport.measurement_assigned.connect(self._on_measurement_assigned_from_viewport)
         self.sagittal_viewport.measurement_assigned.connect(self._on_measurement_assigned_from_viewport)
         self.coronal_viewport.measurement_assigned.connect(self._on_measurement_assigned_from_viewport)
-        
+
         # Polygon creation
         self.axial_viewport.polygon_created.connect(self._on_polygon_created)
         self.sagittal_viewport.polygon_created.connect(self._on_polygon_created)
         self.coronal_viewport.polygon_created.connect(self._on_polygon_created)
-        
+
         # Selection
         self.axial_viewport.measurement_selected.connect(self.measurement_selected.emit)
         self.sagittal_viewport.measurement_selected.connect(self.measurement_selected.emit)
@@ -119,57 +126,104 @@ class MPRViewer(QWidget):
     def set_dicom_data(self, loader: DICOMLoader, measurement_service: MeasurementService):
         """
         Set the DICOM data and measurement service.
-        
+
         Args:
             loader: Loaded DICOM data
             measurement_service: Service for measurement persistence
         """
         self.loader = loader
         self.measurement_service = measurement_service
-        
+
         # Initialize viewports
         self.axial_viewport.set_loader(loader)
         self.sagittal_viewport.set_loader(loader)
         self.coronal_viewport.set_loader(loader)
-        
+
+        # Set up linked planes for crosshair intersection drawing
+        self._sync_linked_planes()
+
         # Load existing measurements
         self._update_measurements_display()
+
+    def _sync_linked_planes(self):
+        """Synchronize all viewports' linked planes from their current view_planes."""
+        planes = {}
+        for vp in [self.axial_viewport, self.sagittal_viewport, self.coronal_viewport]:
+            if vp.view_plane:
+                planes[vp.orientation] = vp.view_plane
+
+        for vp in [self.axial_viewport, self.sagittal_viewport, self.coronal_viewport]:
+            vp.set_linked_planes(planes)
+
+    def _on_plane_rotated(self, target_orientation: str, new_plane):
+        """Handle plane rotation from a viewport arm rotation."""
+        target_vp = self._get_viewport(target_orientation)
+        if target_vp is None:
+            return
+
+        if new_plane is None:
+            # Reset: reinitialize the target viewport's plane
+            target_vp._init_view_plane()
+        else:
+            # Update the target viewport's view plane
+            target_vp.view_plane = new_plane
+
+        # Re-render the target viewport with the new (oblique) plane
+        target_vp._update_display()
+
+        # Sync all linked planes so crosshairs update everywhere
+        self._sync_linked_planes()
+
+    def _get_viewport(self, orientation: str) -> Optional[ViewportWidget]:
+        """Get viewport by orientation name."""
+        if orientation == 'axial':
+            return self.axial_viewport
+        elif orientation == 'sagittal':
+            return self.sagittal_viewport
+        elif orientation == 'coronal':
+            return self.coronal_viewport
+        return None
     
     def _on_axial_slice_changed(self, orientation: str, slice_index: int):
         """Handle axial slice change - update other views' crosshairs."""
         if not self.loader:
             return
-        
+
         # Axial Z position affects sagittal and coronal Y crosshair
         self.sagittal_viewport.crosshair_y = self.sagittal_viewport.display_image.height() - slice_index if self.sagittal_viewport.display_image else 0
         self.coronal_viewport.crosshair_y = self.coronal_viewport.display_image.height() - slice_index if self.coronal_viewport.display_image else 0
-        
+
+        # Sync linked planes (view_plane origin updated by viewport's _on_slider_changed)
+        self._sync_linked_planes()
+
         self.sagittal_viewport.update()
         self.coronal_viewport.update()
         self.slice_changed.emit(orientation, slice_index)
-    
+
     def _on_sagittal_slice_changed(self, orientation: str, slice_index: int):
         """Handle sagittal slice change - update other views' crosshairs."""
         if not self.loader:
             return
-        
-        # Sagittal X position affects axial X crosshair
+
         self.axial_viewport.crosshair_x = slice_index
         self.coronal_viewport.crosshair_x = slice_index
-        
+
+        self._sync_linked_planes()
+
         self.axial_viewport.update()
         self.coronal_viewport.update()
         self.slice_changed.emit(orientation, slice_index)
-    
+
     def _on_coronal_slice_changed(self, orientation: str, slice_index: int):
         """Handle coronal slice change - update other views' crosshairs."""
         if not self.loader:
             return
-        
-        # Coronal Y position affects axial Y crosshair
+
         self.axial_viewport.crosshair_y = slice_index
         self.sagittal_viewport.crosshair_x = slice_index
-        
+
+        self._sync_linked_planes()
+
         self.axial_viewport.update()
         self.sagittal_viewport.update()
         self.slice_changed.emit(orientation, slice_index)
@@ -380,3 +434,11 @@ class MPRViewer(QWidget):
         self.axial_viewport.update()
         self.sagittal_viewport.update()
         self.coronal_viewport.update()
+
+    def reset_oblique(self):
+        """Reset all viewports to standard axis-aligned planes."""
+        for vp in [self.axial_viewport, self.sagittal_viewport, self.coronal_viewport]:
+            vp.crosshair_rotation = 0.0
+            vp._init_view_plane()
+            vp._update_display()
+        self._sync_linked_planes()

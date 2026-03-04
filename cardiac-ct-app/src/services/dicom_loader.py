@@ -633,7 +633,98 @@ class DICOMLoader:
         
         return oblique_slice.astype(np.int16)
     
-    def apply_window(self, image: np.ndarray, 
+    def get_oblique_slice_patient(self, center_patient: np.ndarray,
+                                  col_dir: np.ndarray, row_dir: np.ndarray,
+                                  col_count: int = 0, row_count: int = 0
+                                  ) -> Optional[tuple]:
+        """
+        Extract an oblique slice using patient-space coordinates and directions.
+
+        Args:
+            center_patient: 3D center point in patient coords (mm)
+            col_dir: Unit vector for screen-right direction in patient space
+            row_dir: Unit vector for screen-down direction in patient space
+            col_count: Output width in pixels (auto-computed if 0)
+            row_count: Output height in pixels (auto-computed if 0)
+
+        Returns:
+            Tuple of (slice_data as np.ndarray, pixel_spacing as float), or None
+        """
+        if self.volume is None:
+            return None
+
+        from scipy.ndimage import map_coordinates
+
+        inv_orient = np.linalg.inv(self.orientation)
+        origin = np.array(self.origin)
+        spacing = np.array(self.spacing)  # (x_sp, y_sp, z_sp)
+        dims = self.volume.shape  # (Z, Y, X)
+        pixel_spacing = min(self.spacing)
+
+        # Auto-compute output size from volume extent projected onto plane
+        if col_count <= 0 or row_count <= 0:
+            # Compute volume corners in patient space
+            corners = []
+            for iz in [0, dims[0] - 1]:
+                for iy in [0, dims[1] - 1]:
+                    for ix in [0, dims[2] - 1]:
+                        local = np.array([
+                            ix * spacing[0], iy * spacing[1], iz * spacing[2]
+                        ])
+                        corners.append(self.orientation @ local + origin)
+
+            # Project corners onto plane directions
+            col_proj = [np.dot(c - center_patient, col_dir) for c in corners]
+            row_proj = [np.dot(c - center_patient, row_dir) for c in corners]
+
+            col_range = max(col_proj) - min(col_proj)
+            row_range = max(row_proj) - min(row_proj)
+
+            col_count = max(int(col_range / pixel_spacing) + 1, 64)
+            row_count = max(int(row_range / pixel_spacing) + 1, 64)
+
+        # Convert center to voxel indices (i, j, k)
+        center_local = inv_orient @ (center_patient - origin)
+        k_c = center_local[0] / spacing[0]
+        j_c = center_local[1] / spacing[1]
+        i_c = center_local[2] / spacing[2]
+
+        # Convert directions to voxel displacements per mm
+        col_local = inv_orient @ col_dir
+        row_local = inv_orient @ row_dir
+
+        col_dk = col_local[0] / spacing[0]
+        col_dj = col_local[1] / spacing[1]
+        col_di = col_local[2] / spacing[2]
+
+        row_dk = row_local[0] / spacing[0]
+        row_dj = row_local[1] / spacing[1]
+        row_di = row_local[2] / spacing[2]
+
+        # Create sampling grid (in mm offsets from center)
+        cols_mm = (np.arange(col_count) - col_count / 2.0) * pixel_spacing
+        rows_mm = (np.arange(row_count) - row_count / 2.0) * pixel_spacing
+        cc, rr = np.meshgrid(cols_mm, rows_mm)
+
+        # Compute voxel coordinates for each output pixel
+        coords_i = i_c + cc * col_di + rr * row_di
+        coords_j = j_c + cc * col_dj + rr * row_dj
+        coords_k = k_c + cc * col_dk + rr * row_dk
+
+        # volume axes: [i=Z, j=Y, k=X]
+        coords = np.array([coords_i, coords_j, coords_k])
+
+        result = map_coordinates(
+            self.volume.astype(np.float32),
+            coords,
+            order=1,
+            mode='constant',
+            cval=-1024
+        )
+
+        return result.astype(np.int16), pixel_spacing
+
+    def apply_window(self, image: np.ndarray,
                      window_center: Optional[float] = None,
                      window_width: Optional[float] = None) -> np.ndarray:
         wc = window_center if window_center is not None else self.window_center

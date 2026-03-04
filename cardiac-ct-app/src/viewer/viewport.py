@@ -2,7 +2,7 @@
 Viewport Widget
 
 Single viewport panel for displaying one MPR plane (axial/sagittal/coronal).
-Handles slice display, measurement drawing, and mouse interaction.
+Handles slice display, measurement drawing, mouse interaction, and oblique MPR.
 """
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QFrame, QSlider, QHBoxLayout, QMenu
@@ -15,14 +15,63 @@ from PySide6.QtGui import (
 import numpy as np
 import math
 import traceback
+from dataclasses import dataclass
 from scipy.interpolate import splprep, splev
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from ..services.dicom_loader import DICOMLoader
 from ..services.coordinate_utils import (
-    is_measurement_visible, get_axial_plane, get_sagittal_plane, 
+    is_measurement_visible, get_axial_plane, get_sagittal_plane,
     get_coronal_plane, project_point_to_plane, calculate_length
 )
 from ..types.measurement import Measurement, Point3D, PlaneDefinition
+
+
+@dataclass
+class ViewPlane:
+    """Defines a viewing plane in patient coordinate space (mm).
+
+    col_dir: unit vector for screen-right direction in patient space
+    row_dir: unit vector for screen-down direction in patient space
+    normal:  col_dir x row_dir (into screen)
+    """
+    origin: np.ndarray   # 3D center point in patient coords (mm)
+    col_dir: np.ndarray  # Unit vector: screen-right direction
+    row_dir: np.ndarray  # Unit vector: screen-down direction
+
+    @property
+    def normal(self) -> np.ndarray:
+        """Normal vector (into screen) = col_dir x row_dir."""
+        n = np.cross(self.col_dir, self.row_dir)
+        norm = np.linalg.norm(n)
+        return n / norm if norm > 1e-10 else np.array([0.0, 0.0, 1.0])
+
+    def is_axis_aligned(self, tol: float = 0.01) -> bool:
+        """Check if plane is close to a standard axis-aligned orientation."""
+        n = self.normal
+        for axis in [np.array([1,0,0]), np.array([0,1,0]), np.array([0,0,1]),
+                     np.array([-1,0,0]), np.array([0,-1,0]), np.array([0,0,-1])]:
+            if np.linalg.norm(n - axis) < tol:
+                return True
+        return False
+
+    def copy(self) -> 'ViewPlane':
+        return ViewPlane(self.origin.copy(), self.col_dir.copy(), self.row_dir.copy())
+
+
+def rotate_vector(v: np.ndarray, axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Rotate vector v around axis by angle_rad using Rodrigues' formula."""
+    axis = axis / np.linalg.norm(axis)
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    return v * cos_a + np.cross(axis, v) * sin_a + axis * np.dot(axis, v) * (1 - cos_a)
+
+
+# Color coding for viewports (RadiAnt convention)
+VIEWPORT_COLORS = {
+    'axial': QColor(255, 80, 80, 200),     # Red
+    'sagittal': QColor(80, 80, 255, 200),   # Blue
+    'coronal': QColor(80, 255, 80, 200),    # Green
+}
 
 
 class ViewportWidget(QWidget):
@@ -39,6 +88,7 @@ class ViewportWidget(QWidget):
     measurement_assigned = Signal(Measurement, str)  # measurement, field_id
     polygon_created = Signal(str, list, float)  # orientation, points, value
     measurement_selected = Signal(Measurement)
+    plane_rotated = Signal(str, object)  # target_orientation, new ViewPlane
     
     def __init__(self, orientation: str, parent=None):
         """
@@ -100,6 +150,22 @@ class ViewportWidget(QWidget):
         self.rotating_crosshair: bool = False
         self.rotate_start_pos: Optional[QPoint] = None
         self.rotate_start_angle: float = 0.0
+
+        # 3D plane state for oblique MPR
+        self.view_plane: Optional[ViewPlane] = None
+        self.linked_planes: Dict[str, ViewPlane] = {}  # other viewports' planes
+        self.viewport_color: QColor = VIEWPORT_COLORS.get(orientation, QColor(255, 255, 255))
+
+        # Arm rotation state (rotating a linked viewport's plane)
+        self.rotating_arm: Optional[str] = None  # orientation of the arm being rotated
+        self.arm_rotate_center_screen: Optional[QPoint] = None
+        self.arm_rotate_start_angle_screen: float = 0.0
+        self.arm_rotate_initial_plane: Optional[ViewPlane] = None
+
+        # Oblique rendering state
+        self._oblique_pixel_spacing: float = 1.0
+        self._oblique_col_count: int = 0
+        self._oblique_row_count: int = 0
         
         # Setup UI
         self._setup_ui()
@@ -163,7 +229,7 @@ class ViewportWidget(QWidget):
         self.loader = loader
         if loader and loader.volume is not None:
             dims = loader.get_volume_dimensions()
-            
+
             if self.orientation == 'axial':
                 self.max_slice = dims[0] - 1  # Z slices
                 self.crosshair_x = dims[2] // 2
@@ -176,15 +242,85 @@ class ViewportWidget(QWidget):
                 self.max_slice = dims[1] - 1  # Y slices
                 self.crosshair_x = dims[2] // 2
                 self.crosshair_y = dims[0] // 2
-            
+
             self.current_slice = self.max_slice // 2
             self.slice_slider.setMaximum(self.max_slice)
             self.slice_slider.setValue(self.current_slice)
-            
+
             self.window_center = loader.window_center
             self.window_width = loader.window_width
-            
+
+            # Initialize 3D view plane
+            self._init_view_plane()
+
             self._update_display()
+
+    def _init_view_plane(self):
+        """Initialize the ViewPlane from current orientation and slice."""
+        if not self.loader:
+            return
+        origin = np.array(self.loader.origin)
+        spacing = self.loader.spacing
+        dims = self.loader.get_volume_dimensions()  # (Z, Y, X)
+
+        if self.orientation == 'axial':
+            col_dir = np.array([1.0, 0.0, 0.0])
+            row_dir = np.array([0.0, 1.0, 0.0])
+            center = origin + np.array([
+                dims[2] / 2.0 * spacing[0],
+                dims[1] / 2.0 * spacing[1],
+                self.current_slice * spacing[2]
+            ])
+        elif self.orientation == 'sagittal':
+            col_dir = np.array([0.0, 1.0, 0.0])
+            row_dir = np.array([0.0, 0.0, -1.0])
+            center = origin + np.array([
+                self.current_slice * spacing[0],
+                dims[1] / 2.0 * spacing[1],
+                dims[0] / 2.0 * spacing[2]
+            ])
+        else:  # coronal
+            col_dir = np.array([1.0, 0.0, 0.0])
+            row_dir = np.array([0.0, 0.0, -1.0])
+            center = origin + np.array([
+                dims[2] / 2.0 * spacing[0],
+                self.current_slice * spacing[1],
+                dims[0] / 2.0 * spacing[2]
+            ])
+
+        self.view_plane = ViewPlane(origin=center, col_dir=col_dir, row_dir=row_dir)
+
+    def _update_view_plane_origin(self):
+        """Update the view plane origin when slice changes (axis-aligned mode)."""
+        if not self.view_plane or not self.loader:
+            return
+        origin = np.array(self.loader.origin)
+        spacing = self.loader.spacing
+        dims = self.loader.get_volume_dimensions()
+
+        if self.orientation == 'axial':
+            self.view_plane.origin = origin + np.array([
+                dims[2] / 2.0 * spacing[0],
+                dims[1] / 2.0 * spacing[1],
+                self.current_slice * spacing[2]
+            ])
+        elif self.orientation == 'sagittal':
+            self.view_plane.origin = origin + np.array([
+                self.current_slice * spacing[0],
+                dims[1] / 2.0 * spacing[1],
+                dims[0] / 2.0 * spacing[2]
+            ])
+        else:  # coronal
+            self.view_plane.origin = origin + np.array([
+                dims[2] / 2.0 * spacing[0],
+                self.current_slice * spacing[1],
+                dims[0] / 2.0 * spacing[2]
+            ])
+
+    def set_linked_planes(self, planes: Dict[str, 'ViewPlane']):
+        """Set the linked viewports' planes for crosshair intersection drawing."""
+        self.linked_planes = {k: v for k, v in planes.items() if k != self.orientation}
+        self.update()
     
     def set_slice(self, index: int):
         """Set the current slice index."""
@@ -227,58 +363,93 @@ class ViewportWidget(QWidget):
     def _on_slider_changed(self, value: int):
         """Handle slider value change."""
         self.current_slice = value
+        self._update_view_plane_origin()
         self._update_display()
         self.slice_changed.emit(self.orientation, value)
-    
+
+    def _is_oblique(self) -> bool:
+        """Check if this viewport needs oblique rendering."""
+        return self.view_plane is not None and not self.view_plane.is_axis_aligned()
+
     def _update_display(self):
         """Update the displayed image."""
         if not self.loader or self.loader.volume is None:
             return
-        
-        # Get the appropriate axis-aligned slice
-        if self.orientation == 'axial':
-            slice_data = self.loader.get_axial_slice(self.current_slice)
-        elif self.orientation == 'sagittal':
-            slice_data = self.loader.get_sagittal_slice(self.current_slice)
+
+        if self._is_oblique() and self.view_plane is not None:
+            # Oblique rendering path
+            result = self.loader.get_oblique_slice_patient(
+                self.view_plane.origin,
+                self.view_plane.col_dir,
+                self.view_plane.row_dir
+            )
+            if result is None:
+                return
+            slice_data, self._oblique_pixel_spacing = result
+            self._oblique_row_count, self._oblique_col_count = slice_data.shape
+
+            # Apply window/level
+            display_data = self.loader.apply_window(slice_data,
+                                                     self.window_center,
+                                                     self.window_width)
+            # No flipud needed - row_dir convention handles orientation
         else:
-            slice_data = self.loader.get_coronal_slice(self.current_slice)
-        
-        if slice_data is None:
-            return
-        
-        # Apply window/level
-        display_data = self.loader.apply_window(slice_data, 
-                                                 self.window_center, 
-                                                 self.window_width)
-        
-        # Handle orientation-specific flipping (sagittal/coronal need flip)
-        if self.orientation in ['sagittal', 'coronal']:
-            display_data = np.flipud(display_data)
-        
+            # Standard axis-aligned rendering (fast path)
+            if self.orientation == 'axial':
+                slice_data = self.loader.get_axial_slice(self.current_slice)
+            elif self.orientation == 'sagittal':
+                slice_data = self.loader.get_sagittal_slice(self.current_slice)
+            else:
+                slice_data = self.loader.get_coronal_slice(self.current_slice)
+
+            if slice_data is None:
+                return
+
+            # Apply window/level
+            display_data = self.loader.apply_window(slice_data,
+                                                     self.window_center,
+                                                     self.window_width)
+
+            # Handle orientation-specific flipping (sagittal/coronal need flip)
+            if self.orientation in ['sagittal', 'coronal']:
+                display_data = np.flipud(display_data)
+
         # IMPORTANT: Make contiguous copy for QImage
         display_data = np.ascontiguousarray(display_data, dtype=np.uint8)
-        
-        # Create QImage 
+
+        # Create QImage
         h, w = display_data.shape
         bytes_data = display_data.tobytes()
-        
-        # Create image with explicit format
         self.display_image = QImage(bytes_data, w, h, w, QImage.Format_Grayscale8).copy()
-        
+
         # Update slice label
+        oblique_indicator = " ◇" if self._is_oblique() else ""
         rot_indicator = " ⟳" if abs(self.crosshair_rotation) > 0.1 else ""
-        self.slice_label.setText(f"{self.current_slice + 1}/{self.max_slice + 1}{rot_indicator}")
-        
+        self.slice_label.setText(
+            f"{self.current_slice + 1}/{self.max_slice + 1}{rot_indicator}{oblique_indicator}"
+        )
+
         self.update()
     
     def _get_current_plane(self) -> PlaneDefinition:
         """Get the current plane definition in patient coordinates."""
         if not self.loader:
             return get_axial_plane(0)
-        
+
+        # If we have a ViewPlane (oblique or not), convert it to PlaneDefinition
+        if self.view_plane:
+            n = self.view_plane.normal
+            o = self.view_plane.origin
+            up = -self.view_plane.row_dir  # row_dir is screen-down, up is opposite
+            return PlaneDefinition(
+                origin=Point3D(x=float(o[0]), y=float(o[1]), z=float(o[2])),
+                normal=Point3D(x=float(n[0]), y=float(n[1]), z=float(n[2])),
+                view_up=Point3D(x=float(up[0]), y=float(up[1]), z=float(up[2]))
+            )
+
         spacing = self.loader.spacing
         origin = self.loader.origin
-        
+
         if self.orientation == 'axial':
             z_pos = origin[2] + self.current_slice * spacing[2]
             return get_axial_plane(z_pos)
@@ -293,37 +464,41 @@ class ViewportWidget(QWidget):
         """Convert screen coordinates to patient coordinates."""
         if not self.loader:
             return Point3D(0, 0, 0)
-        
-        # Get image display rect
+
         frame_rect = self.image_frame.rect()
         if self.display_image is None:
             return Point3D(0, 0, 0)
-        
+
         img_w = self.display_image.width()
         img_h = self.display_image.height()
-        
-        # Calculate scale to fit image in frame
+
         scale_x = frame_rect.width() / img_w
         scale_y = frame_rect.height() / img_h
         scale = min(scale_x, scale_y) * self.zoom
-        
-        # Calculate image position (centered)
+
         img_display_w = img_w * scale
         img_display_h = img_h * scale
         offset_x = (frame_rect.width() - img_display_w) / 2 + self.pan_offset.x()
         offset_y = (frame_rect.height() - img_display_h) / 2 + self.pan_offset.y()
-        
-        # Adjust for frame position
+
         local_pos = screen_pos - self.image_frame.pos()
-        
-        # Convert to image coordinates
         img_x = (local_pos.x() - offset_x) / scale
         img_y = (local_pos.y() - offset_y) / scale
-        
-        # Convert to patient coordinates based on orientation
+
+        # Oblique: use view_plane basis vectors
+        if self._is_oblique() and self.view_plane:
+            px_sp = self._oblique_pixel_spacing
+            col_count = self._oblique_col_count
+            row_count = self._oblique_row_count
+            p = (self.view_plane.origin
+                 + (img_x - col_count / 2.0) * px_sp * self.view_plane.col_dir
+                 + (img_y - row_count / 2.0) * px_sp * self.view_plane.row_dir)
+            return Point3D(float(p[0]), float(p[1]), float(p[2]))
+
+        # Axis-aligned: original logic
         spacing = self.loader.spacing
         origin = self.loader.origin
-        
+
         if self.orientation == 'axial':
             x = origin[0] + img_x * spacing[0]
             y = origin[1] + img_y * spacing[1]
@@ -336,48 +511,54 @@ class ViewportWidget(QWidget):
             x = origin[0] + img_x * spacing[0]
             y = origin[1] + self.current_slice * spacing[1]
             z = origin[2] + (img_h - img_y) * spacing[2]
-        
+
         return Point3D(x, y, z)
     
     def _patient_to_screen(self, point: Point3D) -> QPoint:
         """Convert patient coordinates to screen coordinates."""
         if not self.loader or self.display_image is None:
             return QPoint(0, 0)
-        
-        spacing = self.loader.spacing
-        origin = self.loader.origin
-        
-        # Convert to image coordinates
-        if self.orientation == 'axial':
-            img_x = (point.x - origin[0]) / spacing[0]
-            img_y = (point.y - origin[1]) / spacing[1]
-        elif self.orientation == 'sagittal':
-            img_x = (point.y - origin[1]) / spacing[1]
-            img_y = self.display_image.height() - (point.z - origin[2]) / spacing[2]
-        else:  # coronal
-            img_x = (point.x - origin[0]) / spacing[0]
-            img_y = self.display_image.height() - (point.z - origin[2]) / spacing[2]
-        
-        # Get image display rect
+
         frame_rect = self.image_frame.rect()
         img_w = self.display_image.width()
         img_h = self.display_image.height()
-        
-        # Calculate scale
+
         scale_x = frame_rect.width() / img_w
         scale_y = frame_rect.height() / img_h
         scale = min(scale_x, scale_y) * self.zoom
-        
-        # Calculate offset
+
         img_display_w = img_w * scale
         img_display_h = img_h * scale
         offset_x = (frame_rect.width() - img_display_w) / 2 + self.pan_offset.x()
         offset_y = (frame_rect.height() - img_display_h) / 2 + self.pan_offset.y()
-        
-        # Convert to screen coordinates
+
+        # Oblique: use view_plane basis vectors
+        if self._is_oblique() and self.view_plane:
+            px_sp = self._oblique_pixel_spacing
+            col_count = self._oblique_col_count
+            row_count = self._oblique_row_count
+            p = np.array([point.x, point.y, point.z])
+            delta = p - self.view_plane.origin
+            img_x = np.dot(delta, self.view_plane.col_dir) / px_sp + col_count / 2.0
+            img_y = np.dot(delta, self.view_plane.row_dir) / px_sp + row_count / 2.0
+        else:
+            # Axis-aligned: original logic
+            spacing = self.loader.spacing
+            origin = self.loader.origin
+
+            if self.orientation == 'axial':
+                img_x = (point.x - origin[0]) / spacing[0]
+                img_y = (point.y - origin[1]) / spacing[1]
+            elif self.orientation == 'sagittal':
+                img_x = (point.y - origin[1]) / spacing[1]
+                img_y = self.display_image.height() - (point.z - origin[2]) / spacing[2]
+            else:  # coronal
+                img_x = (point.x - origin[0]) / spacing[0]
+                img_y = self.display_image.height() - (point.z - origin[2]) / spacing[2]
+
         screen_x = offset_x + img_x * scale + self.image_frame.x()
         screen_y = offset_y + img_y * scale + self.image_frame.y()
-        
+
         return QPoint(int(screen_x), int(screen_y))
     
     def _get_display_params(self) -> Tuple[QRect, float]:
@@ -454,47 +635,190 @@ class ViewportWidget(QWidget):
             if painter.isActive():
                 painter.end()
     
+    def _compute_plane_intersection_2d(self, other_plane: ViewPlane
+                                       ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """
+        Compute intersection line of another plane with this viewport's plane.
+        Returns (point_2d, direction_2d) in image pixel coordinates, or None.
+        """
+        if not self.view_plane:
+            return None
+
+        my_n = self.view_plane.normal
+        other_n = other_plane.normal
+
+        # 3D intersection line direction
+        line_dir_3d = np.cross(my_n, other_n)
+        if np.linalg.norm(line_dir_3d) < 1e-10:
+            return None  # Parallel planes
+        line_dir_3d = line_dir_3d / np.linalg.norm(line_dir_3d)
+
+        # Find a point on the intersection line by solving:
+        # n1 . (p - o1) = 0, n2 . (p - o2) = 0, line_dir . (p - o1) = 0
+        A = np.array([my_n, other_n, line_dir_3d])
+        b = np.array([
+            np.dot(my_n, self.view_plane.origin),
+            np.dot(other_n, other_plane.origin),
+            np.dot(line_dir_3d, self.view_plane.origin)
+        ])
+
+        try:
+            p_3d = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return None
+
+        # Project to 2D image coordinates
+        delta = p_3d - self.view_plane.origin
+        if self._is_oblique():
+            px_sp = self._oblique_pixel_spacing
+            col_count = self._oblique_col_count
+            row_count = self._oblique_row_count
+        elif self.display_image:
+            # Axis-aligned: compute from image dims and spacing
+            col_count = self.display_image.width()
+            row_count = self.display_image.height()
+            px_sp = 1.0  # Will use voxel-based projection below
+        else:
+            return None
+
+        if self._is_oblique():
+            p_u = np.dot(delta, self.view_plane.col_dir) / px_sp + col_count / 2.0
+            p_v = np.dot(delta, self.view_plane.row_dir) / px_sp + row_count / 2.0
+
+            d_u = np.dot(line_dir_3d, self.view_plane.col_dir)
+            d_v = np.dot(line_dir_3d, self.view_plane.row_dir)
+        else:
+            # Axis-aligned: use orientation-specific projection
+            spacing = self.loader.spacing
+            origin_arr = np.array(self.loader.origin)
+            if self.orientation == 'axial':
+                p_u = (p_3d[0] - origin_arr[0]) / spacing[0]
+                p_v = (p_3d[1] - origin_arr[1]) / spacing[1]
+                d_u = line_dir_3d[0] / spacing[0]
+                d_v = line_dir_3d[1] / spacing[1]
+            elif self.orientation == 'sagittal':
+                p_u = (p_3d[1] - origin_arr[1]) / spacing[1]
+                p_v = row_count - (p_3d[2] - origin_arr[2]) / spacing[2]
+                d_u = line_dir_3d[1] / spacing[1]
+                d_v = -line_dir_3d[2] / spacing[2]
+            else:  # coronal
+                p_u = (p_3d[0] - origin_arr[0]) / spacing[0]
+                p_v = row_count - (p_3d[2] - origin_arr[2]) / spacing[2]
+                d_u = line_dir_3d[0] / spacing[0]
+                d_v = -line_dir_3d[2] / spacing[2]
+
+        return (p_u, p_v), (d_u, d_v)
+
+    def _get_arm_screen_line(self, other_orientation: str, image_rect: QRect, scale: float
+                             ) -> Optional[Tuple[QPoint, QPoint, float, float]]:
+        """
+        Get the screen-space line for a linked plane's intersection with this viewport.
+        Returns (p1_screen, p2_screen, center_u, center_v) or None.
+        """
+        if other_orientation not in self.linked_planes:
+            return None
+
+        result = self._compute_plane_intersection_2d(self.linked_planes[other_orientation])
+        if result is None:
+            return None
+
+        (p_u, p_v), (d_u, d_v) = result
+        d_len = math.sqrt(d_u * d_u + d_v * d_v)
+        if d_len < 1e-10:
+            return None
+
+        # Extend line across the image rect
+        extent = max(image_rect.width(), image_rect.height()) / scale * 2
+        t = extent / d_len
+
+        x1 = image_rect.x() + (p_u - d_u * t) * scale
+        y1 = image_rect.y() + (p_v - d_v * t) * scale
+        x2 = image_rect.x() + (p_u + d_u * t) * scale
+        y2 = image_rect.y() + (p_v + d_v * t) * scale
+
+        return (QPoint(int(x1), int(y1)), QPoint(int(x2), int(y2)), p_u, p_v)
+
     def _draw_crosshair(self, painter: QPainter, image_rect: QRect, scale: float):
-        """Draw the crosshair lines with different colors for X/Y, supporting rotation."""
+        """Draw crosshair lines colored by linked viewport, showing plane intersections."""
         mouse_pos = self.mapFromGlobal(self.cursor().pos())
-        over_v, over_h = self._is_over_crosshair(mouse_pos)
-        is_highlighted = self.dragging_crosshair or self.rotating_crosshair or (over_v or over_h)
-        
-        # Calculate crosshair center in screen coordinates
-        ch_x = image_rect.x() + self.crosshair_x * scale
-        ch_y = image_rect.y() + self.crosshair_y * scale
-        
-        # Get rotation angle in radians
-        angle_rad = math.radians(self.crosshair_rotation)
-        cos_a = math.cos(angle_rad)
-        sin_a = math.sin(angle_rad)
-        
-        # Calculate line endpoints with rotation
-        # Use image rect dimensions for line length
-        half_w = image_rect.width()
-        half_h = image_rect.height()
-        
-        # Horizontal line direction (rotated)
-        h_dx = cos_a * half_w
-        h_dy = sin_a * half_w
-        
-        # Vertical line direction (rotated, perpendicular to horizontal)
-        v_dx = -sin_a * half_h
-        v_dy = cos_a * half_h
-        
-        # Horizontal line - Cyan
-        pen_h = QPen(QColor(0, 255, 255, 200))  # Cyan
-        pen_h.setWidth(2 if is_highlighted else 1)
-        painter.setPen(pen_h)
-        painter.drawLine(int(ch_x - h_dx), int(ch_y - h_dy),
-                        int(ch_x + h_dx), int(ch_y + h_dy))
-        
-        # Vertical line - Magenta
-        pen_v = QPen(QColor(255, 0, 255, 200))  # Magenta
-        pen_v.setWidth(2 if is_highlighted else 1)
-        painter.setPen(pen_v)
-        painter.drawLine(int(ch_x - v_dx), int(ch_y - v_dy),
-                        int(ch_x + v_dx), int(ch_y + v_dy))
+        is_rotating = self.rotating_crosshair or self.rotating_arm is not None
+
+        if self.linked_planes and self.view_plane:
+            # New mode: draw colored intersection lines from linked planes
+            for other_orient, other_plane in self.linked_planes.items():
+                color = VIEWPORT_COLORS.get(other_orient, QColor(255, 255, 255, 200))
+
+                arm_line = self._get_arm_screen_line(other_orient, image_rect, scale)
+                if arm_line is None:
+                    continue
+
+                p1, p2, _, _ = arm_line
+
+                # Check if mouse is near this arm
+                near_arm = self._is_near_line(mouse_pos, p1, p2, tolerance=8)
+                highlighted = near_arm or self.rotating_arm == other_orient or is_rotating
+
+                pen = QPen(color)
+                pen.setWidth(3 if (near_arm or self.rotating_arm == other_orient) else 1)
+                painter.setPen(pen)
+                painter.drawLine(p1, p2)
+
+            # Draw small colored square in corner (viewport identity indicator)
+            indicator_size = 12
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(self.viewport_color))
+            painter.drawRect(
+                image_rect.right() - indicator_size - 4,
+                image_rect.top() + 4,
+                indicator_size, indicator_size
+            )
+        else:
+            # Fallback: original crosshair drawing (before linked planes are set)
+            over_v, over_h = self._is_over_crosshair(mouse_pos)
+            is_highlighted = self.dragging_crosshair or self.rotating_crosshair or (over_v or over_h)
+
+            ch_x = image_rect.x() + self.crosshair_x * scale
+            ch_y = image_rect.y() + self.crosshair_y * scale
+
+            angle_rad = math.radians(self.crosshair_rotation)
+            cos_a = math.cos(angle_rad)
+            sin_a = math.sin(angle_rad)
+
+            half_w = image_rect.width()
+            half_h = image_rect.height()
+
+            h_dx = cos_a * half_w
+            h_dy = sin_a * half_w
+            v_dx = -sin_a * half_h
+            v_dy = cos_a * half_h
+
+            pen_h = QPen(QColor(0, 255, 255, 200))
+            pen_h.setWidth(2 if is_highlighted else 1)
+            painter.setPen(pen_h)
+            painter.drawLine(int(ch_x - h_dx), int(ch_y - h_dy),
+                            int(ch_x + h_dx), int(ch_y + h_dy))
+
+            pen_v = QPen(QColor(255, 0, 255, 200))
+            pen_v.setWidth(2 if is_highlighted else 1)
+            painter.setPen(pen_v)
+            painter.drawLine(int(ch_x - v_dx), int(ch_y - v_dy),
+                            int(ch_x + v_dx), int(ch_y + v_dy))
+
+    @staticmethod
+    def _is_near_line(point: QPoint, line_p1: QPoint, line_p2: QPoint, tolerance: int = 8) -> bool:
+        """Check if a point is within tolerance pixels of a line segment."""
+        px, py = point.x(), point.y()
+        x1, y1 = line_p1.x(), line_p1.y()
+        x2, y2 = line_p2.x(), line_p2.y()
+        dx, dy = x2 - x1, y2 - y1
+        mag_sq = dx * dx + dy * dy
+        if mag_sq < 1:
+            return False
+        u = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / mag_sq))
+        closest_x = x1 + u * dx
+        closest_y = y1 + u * dy
+        dist_sq = (px - closest_x) ** 2 + (py - closest_y) ** 2
+        return dist_sq < tolerance * tolerance
     
     def _draw_measurements(self, painter: QPainter):
         """Draw all visible measurements."""
@@ -905,8 +1229,32 @@ class ViewportWidget(QWidget):
             event.accept()
             return
         
-        # Right mouse + Ctrl = Rotate crosshair lines
+        # Right mouse + Ctrl = Rotate crosshair arm (oblique MPR)
         if event.button() == Qt.RightButton and event.modifiers() & Qt.ControlModifier:
+            # Check which arm the user clicked on
+            if self.linked_planes and self.view_plane:
+                dest_rect, sc = self._get_display_params()
+                for other_orient in self.linked_planes:
+                    arm_line = self._get_arm_screen_line(other_orient, dest_rect, sc)
+                    if arm_line and self._is_near_line(event.pos(), arm_line[0], arm_line[1], tolerance=12):
+                        # Start rotating this arm
+                        self.rotating_arm = other_orient
+                        self.arm_rotate_initial_plane = self.linked_planes[other_orient].copy()
+                        # Compute center of intersection on screen
+                        center_u, center_v = arm_line[2], arm_line[3]
+                        self.arm_rotate_center_screen = QPoint(
+                            int(dest_rect.x() + center_u * sc),
+                            int(dest_rect.y() + center_v * sc)
+                        )
+                        # Store initial angle from center to mouse
+                        dx = event.pos().x() - self.arm_rotate_center_screen.x()
+                        dy = event.pos().y() - self.arm_rotate_center_screen.y()
+                        self.arm_rotate_start_angle_screen = math.atan2(dy, dx)
+                        self.setCursor(Qt.SizeAllCursor)
+                        event.accept()
+                        return
+
+            # Fallback: old rotation behavior
             self.rotating_crosshair = True
             self.rotate_start_pos = event.pos()
             self.rotate_start_angle = self.crosshair_rotation
@@ -1000,33 +1348,55 @@ class ViewportWidget(QWidget):
             self.update()
             return
         
-        # Handle crosshair rotation (Ctrl+Right-drag)
+        # Handle arm rotation (Ctrl+Right-drag on a colored arm)
+        if self.rotating_arm and self.arm_rotate_center_screen and self.arm_rotate_initial_plane and self.view_plane:
+            dx = event.pos().x() - self.arm_rotate_center_screen.x()
+            dy = event.pos().y() - self.arm_rotate_center_screen.y()
+            current_angle = math.atan2(dy, dx)
+            delta_angle = current_angle - self.arm_rotate_start_angle_screen
+
+            # Rotate the linked plane's col_dir and row_dir around this viewport's normal
+            my_normal = self.view_plane.normal
+            init = self.arm_rotate_initial_plane
+            new_col_dir = rotate_vector(init.col_dir, my_normal, delta_angle)
+            new_row_dir = rotate_vector(init.row_dir, my_normal, delta_angle)
+            new_normal = np.cross(new_col_dir, new_row_dir)
+            new_normal = new_normal / np.linalg.norm(new_normal)
+
+            # Keep the plane passing through the same intersection point
+            new_plane = ViewPlane(
+                origin=init.origin.copy(),
+                col_dir=new_col_dir / np.linalg.norm(new_col_dir),
+                row_dir=new_row_dir / np.linalg.norm(new_row_dir)
+            )
+
+            # Emit signal so MPRViewer can update the linked viewport
+            self.plane_rotated.emit(self.rotating_arm, new_plane)
+            self.update()
+            return
+
+        # Handle crosshair rotation (Ctrl+Right-drag) - fallback
         if self.rotating_crosshair and self.rotate_start_pos:
-            # Calculate angle based on mouse position relative to crosshair center
             dest_rect, scale = self._get_display_params()
             ch_x = dest_rect.x() + self.crosshair_x * scale
             ch_y = dest_rect.y() + self.crosshair_y * scale
-            
-            # Calculate angle from center to current mouse position
+
             dx = event.pos().x() - ch_x
             dy = event.pos().y() - ch_y
             current_angle = math.degrees(math.atan2(dy, dx))
-            
-            # Calculate angle from center to start position
+
             start_dx = self.rotate_start_pos.x() - ch_x
             start_dy = self.rotate_start_pos.y() - ch_y
             start_angle = math.degrees(math.atan2(start_dy, start_dx))
-            
-            # Calculate rotation delta
+
             delta_angle = current_angle - start_angle
             self.crosshair_rotation = self.rotate_start_angle + delta_angle
-            
-            # Normalize to -180 to 180
+
             while self.crosshair_rotation > 180:
                 self.crosshair_rotation -= 360
             while self.crosshair_rotation < -180:
                 self.crosshair_rotation += 360
-            
+
             self.update()
             return
         
@@ -1038,13 +1408,24 @@ class ViewportWidget(QWidget):
                 self.crosshair_y = (event.position().y() - dest_rect.y()) / scale
                 self.crosshair_moved.emit(self.orientation, self.crosshair_x, self.crosshair_y)
         
-        # Change cursor if over crosshair (and not measuring)
+        # Change cursor if over crosshair arm (and not measuring)
         if not self.measuring and not self.selected_measurement:
-             over_v, over_h = self._is_over_crosshair(event.pos())
-             if over_v or over_h:
-                 self.setCursor(Qt.SizeAllCursor if (over_v and over_h) else (Qt.SizeHorCursor if over_v else Qt.SizeVerCursor))
-             else:
-                 self.setCursor(Qt.ArrowCursor)
+            near_any_arm = False
+            if self.linked_planes and self.view_plane:
+                dest_rect, sc = self._get_display_params()
+                for other_orient in self.linked_planes:
+                    arm_line = self._get_arm_screen_line(other_orient, dest_rect, sc)
+                    if arm_line and self._is_near_line(event.pos(), arm_line[0], arm_line[1], tolerance=8):
+                        near_any_arm = True
+                        break
+            if near_any_arm:
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                over_v, over_h = self._is_over_crosshair(event.pos())
+                if over_v or over_h:
+                    self.setCursor(Qt.SizeAllCursor if (over_v and over_h) else (Qt.SizeHorCursor if over_v else Qt.SizeVerCursor))
+                else:
+                    self.setCursor(Qt.ArrowCursor)
         
         if self.measuring:
             self.measure_end = event.pos()
@@ -1115,9 +1496,14 @@ class ViewportWidget(QWidget):
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """Finish polygon on double click, or reset crosshair rotation on right double-click."""
-        # Right double-click = Reset crosshair rotation
+        # Right double-click = Reset to standard axis-aligned planes
         if event.button() == Qt.RightButton:
             self.crosshair_rotation = 0.0
+            self._init_view_plane()  # Reset to axis-aligned
+            # Emit plane_rotated for each linked viewport to reset them too
+            for other_orient in list(self.linked_planes.keys()):
+                # Signal MPRViewer to reset the linked viewport
+                self.plane_rotated.emit(other_orient, None)  # None = reset
             self.update()
             event.accept()
             return
@@ -1167,8 +1553,15 @@ class ViewportWidget(QWidget):
             event.accept()
             return
         
-        # End crosshair rotation
+        # End arm rotation or crosshair rotation
         if event.button() == Qt.RightButton:
+            if self.rotating_arm:
+                self.rotating_arm = None
+                self.arm_rotate_center_screen = None
+                self.arm_rotate_initial_plane = None
+                self.setCursor(Qt.ArrowCursor)
+                event.accept()
+                return
             if self.rotating_crosshair:
                 self.rotating_crosshair = False
                 self.rotate_start_pos = None
@@ -1213,27 +1606,37 @@ class ViewportWidget(QWidget):
     def wheelEvent(self, event: QWheelEvent):
         """Handle scroll wheel for slice navigation or zoom (Ctrl+Scroll)."""
         delta = event.angleDelta().y()
-        
+
         # Ctrl+Scroll = Zoom
         if event.modifiers() & Qt.ControlModifier:
             zoom_factor = 1.1 if delta > 0 else 0.9
-            self.zoom = max(0.5, min(5.0, self.zoom * zoom_factor))  # Clamp between 0.5x and 5x
+            self.zoom = max(0.5, min(5.0, self.zoom * zoom_factor))
             self.update()
             event.accept()
             return
-        
-        # Regular scroll = slice navigation
+
+        # For oblique planes, scroll along the normal direction
+        if self._is_oblique() and self.view_plane and self.loader:
+            step_mm = min(self.loader.spacing) * (1 if delta > 0 else -1)
+            self.view_plane.origin = self.view_plane.origin + step_mm * self.view_plane.normal
+            self._update_display()
+            # Emit slice_changed so MPRViewer can sync linked planes
+            self.slice_changed.emit(self.orientation, self.current_slice)
+            event.accept()
+            return
+
+        # Regular scroll = slice navigation (axis-aligned)
         if delta > 0:
             new_slice = self.current_slice + 1
         else:
             new_slice = self.current_slice - 1
-        
+
         new_slice = max(0, min(new_slice, self.max_slice))
-        
+
         if new_slice != self.current_slice:
             self.set_slice(new_slice)
             self.slice_changed.emit(self.orientation, new_slice)
-        
+
         event.accept()
 
     def keyPressEvent(self, event):

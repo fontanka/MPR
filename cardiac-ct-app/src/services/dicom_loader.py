@@ -600,7 +600,7 @@ class DICOMLoader:
         Returns:
             Tuple of (slice_data as np.ndarray, pixel_spacing as float), or None
         """
-        if self.volume is None:
+        if self.volume is None or self._volume_f32 is None:
             return None
 
         from scipy.ndimage import map_coordinates

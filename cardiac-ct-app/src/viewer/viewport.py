@@ -10,7 +10,7 @@ All 3D state lives in MPRState (owned by MPRViewer).
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QFrame, QSlider, QHBoxLayout, QMenu
 )
-from PySide6.QtCore import Qt, Signal, QPoint, QRect
+from PySide6.QtCore import Qt, Signal, QPoint, QRect, QTimer
 from PySide6.QtGui import (
     QPainter, QImage, QPen, QColor, QFont, QBrush, QMouseEvent, QWheelEvent, QPixmap,
     QContextMenuEvent, QAction, QPainterPath
@@ -144,13 +144,13 @@ class ViewportWidget(QWidget):
         self.arm_rotate_start_angle_screen: float = 0.0
         self.arm_rotate_initial_plane: Optional[ViewPlane] = None
         self.arm_rotate_initial_other_plane: Optional[ViewPlane] = None  # for locked rotation
+        self._arm_rotate_third_orient: Optional[str] = None
         self.locked_rotation: bool = True  # RadiAnt-style: maintain 90° between axes
 
         # Scroll speed multiplier
         self.scroll_multiplier: int = 1
 
         # Rotation throttle (cap at ~33fps to reduce CPU on weak machines)
-        from PySide6.QtCore import QTimer
         self._rotation_throttle = QTimer()
         self._rotation_throttle.setSingleShot(True)
         self._rotation_throttle.setInterval(30)
@@ -1485,6 +1485,10 @@ class ViewportWidget(QWidget):
                 self.rotating_arm = None
                 self.arm_rotate_center_screen = None
                 self.arm_rotate_initial_plane = None
+                self.arm_rotate_initial_other_plane = None
+                self._arm_rotate_third_orient = None
+                self._pending_rotation = None
+                self._pending_locked_rotation = None
                 self.setCursor(Qt.ArrowCursor)
                 event.accept()
                 return

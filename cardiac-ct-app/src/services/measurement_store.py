@@ -289,9 +289,12 @@ class AnnotationService:
     def save(self):
         filepath = self._get_filepath()
         if filepath:
-            Path(self.workspace_path).mkdir(parents=True, exist_ok=True)
-            with open(filepath, 'w') as f:
-                json.dump(self._annotations, f, indent=2)
+            try:
+                Path(self.workspace_path).mkdir(parents=True, exist_ok=True)
+                with open(filepath, 'w') as f:
+                    json.dump(self._annotations, f, indent=2)
+            except (IOError, OSError) as e:
+                print(f"Warning: Failed to save annotations: {e}")
 
     def get(self, series_uid: str) -> str:
         return self._annotations.get(series_uid, "")

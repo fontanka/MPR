@@ -50,10 +50,38 @@ class PlaneDefinition:
 
 
 @dataclass
+class AxisLine:
+    """A stored axis line on a polygon measurement (e.g. major/minor axis)."""
+    p1: Point3D
+    p2: Point3D
+    value: float  # length in mm
+    label_position: Optional[Point3D] = None
+
+    def to_dict(self) -> dict:
+        result = {
+            "p1": self.p1.to_dict(),
+            "p2": self.p2.to_dict(),
+            "value": self.value,
+        }
+        if self.label_position:
+            result["label_position"] = self.label_position.to_dict()
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AxisLine":
+        return cls(
+            p1=Point3D.from_dict(data["p1"]),
+            p2=Point3D.from_dict(data["p2"]),
+            value=data["value"],
+            label_position=Point3D.from_dict(data["label_position"]) if data.get("label_position") else None,
+        )
+
+
+@dataclass
 class Measurement:
     """
     A measurement stored in patient-space coordinates.
-    
+
     This is the core data structure that enables persistence across
     plane changes and session restarts.
     """
@@ -61,27 +89,28 @@ class Measurement:
     study_instance_uid: str
     series_instance_uid: str
     frame_of_reference_uid: Optional[str]
-    
+
     # Measurement type
     type: str  # 'length', 'diameter', 'area'
     anatomy_tag: str  # 'RA', 'SVC', 'IVC', 'Azygos', 'Hepatic', 'Innominate'
     protocol_field_id: str  # Maps to report template field
-    
+
     # Geometry in patient coordinates (mm)
     points: List[Point3D]
     plane: PlaneDefinition  # Plane at time of creation
-    
+
     # Result
     value: float  # Measurement value in mm
-    
+
     # Metadata
     timestamp: str
     user_id: str
     screenshot_path: Optional[str] = None
-    
+
     # Advanced visualization
     label_position: Optional[Point3D] = None
     show_axes: bool = False
+    axes: List[AxisLine] = field(default_factory=list)
     
     def to_dict(self) -> dict:
         return {
@@ -99,7 +128,8 @@ class Measurement:
             "userId": self.user_id,
             "screenshotPath": self.screenshot_path,
             "label_position": self.label_position.to_dict() if self.label_position else None,
-            "show_axes": self.show_axes
+            "show_axes": self.show_axes,
+            "axes": [a.to_dict() for a in self.axes]
         }
     
     @classmethod
@@ -119,7 +149,8 @@ class Measurement:
             user_id=data["userId"],
             screenshot_path=data.get("screenshotPath"),
             label_position=Point3D.from_dict(data["label_position"]) if data.get("label_position") else None,
-            show_axes=data.get("show_axes", False)
+            show_axes=data.get("show_axes", False),
+            axes=[AxisLine.from_dict(a) for a in data.get("axes", [])]
         )
     
     @staticmethod

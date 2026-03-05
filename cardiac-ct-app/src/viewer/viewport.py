@@ -26,7 +26,7 @@ from ..services.coordinate_utils import (
     is_measurement_visible, get_axial_plane, get_sagittal_plane,
     get_coronal_plane, project_point_to_plane, calculate_length
 )
-from ..types.measurement import Measurement, Point3D, PlaneDefinition
+from ..types.measurement import Measurement, Point3D, PlaneDefinition, AxisLine
 
 
 @dataclass
@@ -108,6 +108,7 @@ class ViewportWidget(QWidget):
     polygon_created = Signal(str, list, float)  # orientation, points, value
     measurement_selected = Signal(object)  # Measurement or None
     window_level_changed = Signal(float, float)  # center, width
+    cursor_ball_changed = Signal(object, object)  # np.ndarray position (or None), QColor (or None)
 
     # Keep slice_changed for status bar
     slice_changed = Signal(str, int)  # orientation, slice_index
@@ -176,9 +177,14 @@ class ViewportWidget(QWidget):
 
         # Editing state
         self.selected_measurement: Optional[Measurement] = None
-        self.drag_handle: str = ""  # 'start', 'end', 'move', 'handle_N', 'label_move'
+        self.drag_handle: str = ""  # 'start', 'end', 'move', 'handle_N', 'label_move', 'axis_p1_N', 'axis_p2_N', 'axis_label_N'
         self.drag_start_pos: Optional[QPoint] = None
         self.drag_initial_points: List[Point3D] = []
+        self._selected_axis_index: int = -1  # which axis line is selected (-1 = none)
+
+        # Cursor ball state: 3D patient coord + color, set by MPRViewer
+        self._cursor_ball_pos: Optional[np.ndarray] = None
+        self._cursor_ball_color: Optional[QColor] = None
 
         # Current protocol field for new measurements
         self.current_protocol_field: str = ""
@@ -766,6 +772,15 @@ class ViewportWidget(QWidget):
             painter.setBrush(QBrush(QColor(255, 255, 255, 180)))
             painter.drawEllipse(center, 4, 4)
 
+        # Draw cursor ball (broadcast from another viewport's crosshair hover)
+        if self._cursor_ball_pos is not None and self._cursor_ball_color is not None:
+            ball_sx, ball_sy = self._patient_to_screen_f(self._cursor_ball_pos)
+            ball_screen = QPoint(int(ball_sx), int(ball_sy))
+            if image_rect.contains(ball_screen):
+                painter.setPen(QPen(self._cursor_ball_color.darker(130), 2))
+                painter.setBrush(QBrush(self._cursor_ball_color))
+                painter.drawEllipse(ball_screen, 6, 6)
+
         # Draw small colored square in corner (viewport identity indicator)
         indicator_size = 12
         painter.setPen(Qt.NoPen)
@@ -1035,39 +1050,83 @@ class ViewportWidget(QWidget):
 
         return axes_lines
 
+    def _auto_compute_axes(self, measurement: Measurement, pts_screen: List[QPoint]):
+        """Auto-compute major/minor axes and store in measurement.axes."""
+        axes_screen = self._calculate_projection_axes(pts_screen)
+        measurement.axes.clear()
+        for p1_s, p2_s, _ in axes_screen:
+            pt1_pat = self._screen_to_patient(p1_s)
+            pt2_pat = self._screen_to_patient(p2_s)
+            length_mm = calculate_length(pt1_pat, pt2_pat)
+            if length_mm > 1.0:
+                measurement.axes.append(AxisLine(p1=pt1_pat, p2=pt2_pat, value=length_mm))
+
     def _draw_axis_lines(self, painter: QPainter, measurement: Measurement, pts_screen: List[QPoint]):
-        """Calculate and draw internal axis lines."""
-        axes = self._calculate_projection_axes(pts_screen)
+        """Draw stored axis lines. Auto-compute if none exist yet."""
+        if not measurement.axes:
+            self._auto_compute_axes(measurement, pts_screen)
 
-        pen = QPen(QColor(0, 255, 0))
-        pen.setWidth(1)
-        painter.setPen(pen)
+        is_selected = (measurement == self.selected_measurement)
 
-        for idx, (p1, p2, dist_px) in enumerate(axes):
+        for idx, axis in enumerate(measurement.axes):
+            p1 = self._patient_to_screen(axis.p1)
+            p2 = self._patient_to_screen(axis.p2)
+
+            # Highlight the selected axis
+            is_active_axis = (is_selected and self._selected_axis_index == idx)
+            color = QColor(255, 255, 0) if is_active_axis else QColor(0, 255, 0)
+            pen = QPen(color)
+            pen.setWidth(2 if is_active_axis else 1)
+            pen.setStyle(Qt.DashDotLine)
+            painter.setPen(pen)
             painter.drawLine(p1, p2)
 
-            pt1_pat = self._screen_to_patient(p1)
-            pt2_pat = self._screen_to_patient(p2)
-            length_mm = calculate_length(pt1_pat, pt2_pat)
+            # Draw endpoints if selected
+            if is_selected:
+                painter.setBrush(QBrush(color))
+                painter.setPen(Qt.NoPen)
+                r = 5 if is_active_axis else 3
+                painter.drawEllipse(p1, r, r)
+                painter.drawEllipse(p2, r, r)
 
-            mid_x = (p1.x() + p2.x()) / 2
-            mid_y = (p1.y() + p2.y()) / 2
+            # Label
+            label_pos = self._get_axis_label_screen_pos(axis, p1, p2, idx)
 
-            dx = p2.x() - p1.x()
-            dy = p2.y() - p1.y()
-            length = math.sqrt(dx*dx + dy*dy) if dx*dx + dy*dy > 0 else 1
-            perp_x = -dy / length
-            perp_y = dx / length
+            label = f"{axis.value:.1f} mm"
+            font = QFont("Arial", 9)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(label)
+            th = fm.height()
 
-            offset = 15 if idx == 0 else -15
-            label_x = int(mid_x + perp_x * offset)
-            label_y = int(mid_y + perp_y * offset)
+            bg_rect = QRect(label_pos.x() - tw // 2 - 3, label_pos.y() - th // 2 - 2, tw + 6, th + 4)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 0, 0, 160)))
+            painter.drawRect(bg_rect)
 
-            label = f"{length_mm:.1f} mm"
-            painter.drawText(label_x, label_y, label)
+            painter.setPen(color)
+            painter.drawText(bg_rect.left() + 3, bg_rect.top() + fm.ascent() + 2, label)
+
+    def _get_axis_label_screen_pos(self, axis: AxisLine, p1_s: QPoint, p2_s: QPoint, idx: int) -> QPoint:
+        """Get screen position for axis label — uses stored label_position or auto-offset."""
+        if axis.label_position:
+            return self._patient_to_screen(axis.label_position)
+
+        mid_x = (p1_s.x() + p2_s.x()) / 2
+        mid_y = (p1_s.y() + p2_s.y()) / 2
+        dx = p2_s.x() - p1_s.x()
+        dy = p2_s.y() - p1_s.y()
+        length = math.sqrt(dx * dx + dy * dy) if dx * dx + dy * dy > 0 else 1
+        perp_x = -dy / length
+        perp_y = dx / length
+        offset = 18 if idx == 0 else -18
+        return QPoint(int(mid_x + perp_x * offset), int(mid_y + perp_y * offset))
 
     def _find_measurement_at_pos(self, pos: QPoint) -> Tuple[Optional[Measurement], str]:
-        """Find measurement at screen position."""
+        """Find measurement at screen position.
+        Returns (measurement, handle_type) where handle_type can be:
+        'handle_N', 'label_move', 'move', 'axis_p1_N', 'axis_p2_N', 'axis_label_N', 'axis_move_N'
+        """
         tol = 8
 
         for m in self.measurements:
@@ -1076,6 +1135,25 @@ class ViewportWidget(QWidget):
                 continue
 
             pts_screen = [self._patient_to_screen(p) for p in m.points]
+
+            # Check axis hits first (they're drawn on top)
+            if m.type == 'polygon' and m.show_axes and m.axes:
+                for i, axis in enumerate(m.axes):
+                    ap1 = self._patient_to_screen(axis.p1)
+                    ap2 = self._patient_to_screen(axis.p2)
+                    # Axis label
+                    lbl_pos = self._get_axis_label_screen_pos(axis, ap1, ap2, i)
+                    lbl_rect = QRect(lbl_pos.x() - 40, lbl_pos.y() - 12, 80, 24)
+                    if lbl_rect.contains(pos):
+                        return m, f'axis_label_{i}'
+                    # Axis endpoints
+                    if (ap1 - pos).manhattanLength() < tol:
+                        return m, f'axis_p1_{i}'
+                    if (ap2 - pos).manhattanLength() < tol:
+                        return m, f'axis_p2_{i}'
+                    # Axis line body
+                    if self._is_near_line(pos, ap1, ap2, tolerance=tol):
+                        return m, f'axis_move_{i}'
 
             # Check label hit
             if m.type == 'polygon' and len(m.points) >= 3:
@@ -1225,12 +1303,30 @@ class ViewportWidget(QWidget):
                    Point3D(p.x, p.y, p.z) for p in m.points
                 ]
 
+            # Track which axis is selected
+            if handle.startswith('axis_'):
+                try:
+                    idx = int(handle.split('_')[-1])
+                    self._selected_axis_index = idx
+                    # For axis_move, store initial axis endpoints
+                    if handle.startswith('axis_move_') and 0 <= idx < len(m.axes):
+                        ax = m.axes[idx]
+                        self.drag_initial_points = [
+                            Point3D(ax.p1.x, ax.p1.y, ax.p1.z),
+                            Point3D(ax.p2.x, ax.p2.y, ax.p2.z),
+                        ]
+                except (ValueError, IndexError):
+                    pass
+            else:
+                self._selected_axis_index = -1
+
             self.update()
             return
 
         # 4. Deselect if clicked empty space
         if self.selected_measurement:
             self.selected_measurement = None
+            self._selected_axis_index = -1
             self.measurement_selected.emit(None)
             self.update()
             # Don't return — fall through to crosshair interaction
@@ -1391,6 +1487,14 @@ class ViewportWidget(QWidget):
             if old_hover_arm != self._hover_arm or old_hover_int != self._hover_intersection:
                 needs_repaint = True
 
+            # Cursor ball: emit 3D position when hovering over a crosshair arm
+            if self._hover_arm and self.mpr_state:
+                ball_pos = self._screen_to_patient_3d(event.pos())
+                ball_color = VIEWPORT_COLORS.get(self._hover_arm, QColor(255, 255, 255))
+                self.cursor_ball_changed.emit(ball_pos, ball_color)
+            elif not self._hover_arm:
+                self.cursor_ball_changed.emit(None, None)
+
         if self.measuring:
             self.measure_end = event.pos()
             self.update()
@@ -1418,6 +1522,43 @@ class ViewportWidget(QWidget):
                         m.points[idx] = current_pt_pat
                 except (ValueError, IndexError):
                     pass
+            elif self.drag_handle.startswith('axis_p1_') or self.drag_handle.startswith('axis_p2_'):
+                try:
+                    parts = self.drag_handle.split('_')
+                    idx = int(parts[2])
+                    if 0 <= idx < len(m.axes):
+                        if parts[1] == 'p1':
+                            m.axes[idx].p1 = current_pt_pat
+                        else:
+                            m.axes[idx].p2 = current_pt_pat
+                        m.axes[idx].value = calculate_length(m.axes[idx].p1, m.axes[idx].p2)
+                except (ValueError, IndexError):
+                    pass
+            elif self.drag_handle.startswith('axis_label_'):
+                try:
+                    idx = int(self.drag_handle.split('_')[2])
+                    if 0 <= idx < len(m.axes):
+                        m.axes[idx].label_position = current_pt_pat
+                except (ValueError, IndexError):
+                    pass
+            elif self.drag_handle.startswith('axis_move_'):
+                try:
+                    idx = int(self.drag_handle.split('_')[2])
+                    if 0 <= idx < len(m.axes):
+                        start_pt_pat = self._screen_to_patient(self.drag_start_pos)
+                        dx = current_pt_pat.x - start_pt_pat.x
+                        dy = current_pt_pat.y - start_pt_pat.y
+                        dz = current_pt_pat.z - start_pt_pat.z
+                        if len(self.drag_initial_points) >= 2:
+                            m.axes[idx].p1 = Point3D(self.drag_initial_points[0].x + dx,
+                                                      self.drag_initial_points[0].y + dy,
+                                                      self.drag_initial_points[0].z + dz)
+                            m.axes[idx].p2 = Point3D(self.drag_initial_points[1].x + dx,
+                                                      self.drag_initial_points[1].y + dy,
+                                                      self.drag_initial_points[1].z + dz)
+                            m.axes[idx].value = calculate_length(m.axes[idx].p1, m.axes[idx].p2)
+                except (ValueError, IndexError):
+                    pass
 
             if m.type == 'polygon' and len(m.points) >= 3:
                 perimeter = 0
@@ -1441,6 +1582,9 @@ class ViewportWidget(QWidget):
         if self._wl_dragging:
             self._wl_dragging = False
             self._wl_start_pos = None
+        if self._hover_arm:
+            self._hover_arm = None
+            self.cursor_ball_changed.emit(None, None)
         self._hover_arm = None
         self._hover_intersection = False
         self.setCursor(Qt.ArrowCursor)
@@ -1581,21 +1725,36 @@ class ViewportWidget(QWidget):
     def keyPressEvent(self, event):
         """Handle keyboard events."""
         if event.key() == Qt.Key_Delete and self.selected_measurement:
-            self.measurement_deleted.emit(self.selected_measurement)
-            self.selected_measurement = None
-            self.update()
+            m = self.selected_measurement
+            # If an axis is selected, delete just that axis
+            if self._selected_axis_index >= 0 and 0 <= self._selected_axis_index < len(m.axes):
+                m.axes.pop(self._selected_axis_index)
+                self._selected_axis_index = -1
+                self.measurement_modified.emit(m)
+                self.update()
+            else:
+                self.measurement_deleted.emit(m)
+                self.selected_measurement = None
+                self._selected_axis_index = -1
+                self.update()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def contextMenuEvent(self, event: QContextMenuEvent):
         """Show context menu."""
         if not self.selected_measurement:
-             m, _ = self._find_measurement_at_pos(event.pos())
+             m, handle = self._find_measurement_at_pos(event.pos())
              if m:
                  self.selected_measurement = m
+                 if handle and handle.startswith('axis_'):
+                     try:
+                         self._selected_axis_index = int(handle.split('_')[-1])
+                     except (ValueError, IndexError):
+                         pass
                  self.update()
 
         if self.selected_measurement:
-            # Capture current value — avoid stale lambda closure
             m = self.selected_measurement
             field = self.current_protocol_field
             menu = QMenu(self)
@@ -1607,9 +1766,33 @@ class ViewportWidget(QWidget):
                 )
                 menu.addAction(assign_action)
 
+            # Axis-specific actions for polygons
+            if m.type == 'polygon':
+                menu.addSeparator()
+
+                if self._selected_axis_index >= 0 and self._selected_axis_index < len(m.axes):
+                    ai = self._selected_axis_index
+                    del_axis_action = QAction(f"Delete Axis {ai + 1}", self)
+                    del_axis_action.triggered.connect(
+                        lambda _=False, _m=m, _i=ai: self._delete_axis(_m, _i)
+                    )
+                    menu.addAction(del_axis_action)
+
+                    reset_lbl_action = QAction("Reset Axis Label Position", self)
+                    reset_lbl_action.triggered.connect(
+                        lambda _=False, _m=m, _i=ai: self._reset_axis_label(_m, _i)
+                    )
+                    menu.addAction(reset_lbl_action)
+
+                recompute_action = QAction("Recompute Axes", self)
+                recompute_action.triggered.connect(
+                    lambda _=False, _m=m: self._recompute_axes(_m)
+                )
+                menu.addAction(recompute_action)
+
             menu.addSeparator()
 
-            delete_action = QAction("Delete", self)
+            delete_action = QAction("Delete Measurement", self)
             delete_action.triggered.connect(
                 lambda _=False, _m=m: (
                     self.measurement_deleted.emit(_m),
@@ -1620,6 +1803,46 @@ class ViewportWidget(QWidget):
             menu.addAction(delete_action)
 
             menu.exec(event.globalPos())
+
+    def _delete_axis(self, m: Measurement, idx: int):
+        """Delete an axis from a measurement."""
+        if 0 <= idx < len(m.axes):
+            m.axes.pop(idx)
+            self._selected_axis_index = -1
+            self.measurement_modified.emit(m)
+            self.update()
+
+    def _reset_axis_label(self, m: Measurement, idx: int):
+        """Reset axis label to auto-position."""
+        if 0 <= idx < len(m.axes):
+            m.axes[idx].label_position = None
+            self.measurement_modified.emit(m)
+            self.update()
+
+    def _recompute_axes(self, m: Measurement):
+        """Recompute auto-axes for a polygon measurement."""
+        pts_screen = [self._patient_to_screen(p) for p in m.points]
+        self._auto_compute_axes(m, pts_screen)
+        self._selected_axis_index = -1
+        self.measurement_modified.emit(m)
+        self.update()
+
+    def set_cursor_ball(self, pos, color):
+        """Set cursor ball position/color (called by MPRViewer broadcast)."""
+        changed = False
+        if pos is not None:
+            pos_arr = np.array(pos, dtype=np.float64)
+            if self._cursor_ball_pos is None or not np.array_equal(self._cursor_ball_pos, pos_arr):
+                self._cursor_ball_pos = pos_arr
+                self._cursor_ball_color = color
+                changed = True
+        else:
+            if self._cursor_ball_pos is not None:
+                self._cursor_ball_pos = None
+                self._cursor_ball_color = None
+                changed = True
+        if changed:
+            self.update()
 
     def set_window_level(self, center: float, width: float):
         """Set window/level values."""

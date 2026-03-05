@@ -101,6 +101,7 @@ class MPRViewer(QWidget):
             vp.polygon_created.connect(self._on_polygon_created)
             vp.measurement_selected.connect(lambda m, src=vp: self._on_measurement_selected_from_viewport(m, src))
             vp.window_level_changed.connect(self._on_window_level_changed_from_viewport)
+            vp.cursor_ball_changed.connect(lambda pos, color, src=vp: self._on_cursor_ball_changed(pos, color, src))
 
     def _viewports(self) -> List[ViewportWidget]:
         return [self.axial_viewport, self.sagittal_viewport, self.coronal_viewport]
@@ -479,6 +480,11 @@ class MPRViewer(QWidget):
                 vp.selected_measurement = None
                 vp.update()
         self.measurement_selected.emit(measurement)
+
+    def _on_cursor_ball_changed(self, pos, color, source_viewport):
+        """Broadcast cursor ball position to all viewports (including source)."""
+        for vp in self._viewports():
+            vp.set_cursor_ball(pos, color)
 
     def _on_window_level_changed_from_viewport(self, center: float, width: float):
         """Sync window/level from one viewport's drag to all viewports and app."""

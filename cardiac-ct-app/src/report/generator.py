@@ -201,7 +201,7 @@ class ReportGenerator:
             summary_data = [['Parameter', 'Result [mm]']]
             for field in get_protocol_fields():
                 value = measurement_lookup.get(field.id, 'NA')
-                if value != 'NA':
+                if value != 'NA' and isinstance(value, (int, float)):
                     value = f"{value:.1f}"
                 summary_data.append([field.name, value])
             

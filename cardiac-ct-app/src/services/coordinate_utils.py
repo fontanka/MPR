@@ -22,16 +22,19 @@ def project_point_to_plane(point: Point3D, plane: PlaneDefinition) -> Point3D:
     p = np.array([point.x, point.y, point.z])
     origin = np.array([plane.origin.x, plane.origin.y, plane.origin.z])
     normal = np.array([plane.normal.x, plane.normal.y, plane.normal.z])
-    
+
     # Normalize the normal vector
-    normal = normal / np.linalg.norm(normal)
-    
+    norm = np.linalg.norm(normal)
+    if norm < 1e-10:
+        return Point3D(x=point.x, y=point.y, z=point.z)
+    normal = normal / norm
+
     # Calculate signed distance from point to plane
     d = np.dot(p - origin, normal)
-    
+
     # Project point onto plane
     projected = p - d * normal
-    
+
     return Point3D(x=projected[0], y=projected[1], z=projected[2])
 
 
@@ -49,10 +52,13 @@ def distance_to_plane(point: Point3D, plane: PlaneDefinition) -> float:
     p = np.array([point.x, point.y, point.z])
     origin = np.array([plane.origin.x, plane.origin.y, plane.origin.z])
     normal = np.array([plane.normal.x, plane.normal.y, plane.normal.z])
-    
+
     # Normalize
-    normal = normal / np.linalg.norm(normal)
-    
+    norm = np.linalg.norm(normal)
+    if norm < 1e-10:
+        return 0.0
+    normal = normal / norm
+
     return float(np.dot(p - origin, normal))
 
 

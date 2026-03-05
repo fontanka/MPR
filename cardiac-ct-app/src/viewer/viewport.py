@@ -63,7 +63,10 @@ class ViewPlane:
 
 def rotate_vector(v: np.ndarray, axis: np.ndarray, angle_rad: float) -> np.ndarray:
     """Rotate vector v around axis by angle_rad using Rodrigues' formula."""
-    axis = axis / np.linalg.norm(axis)
+    norm = np.linalg.norm(axis)
+    if norm < 1e-10:
+        return v.copy()
+    axis = axis / norm
     cos_a = np.cos(angle_rad)
     sin_a = np.sin(angle_rad)
     return v * cos_a + np.cross(axis, v) * sin_a + axis * np.dot(axis, v) * (1 - cos_a)
@@ -436,10 +439,14 @@ class ViewportWidget(QWidget):
 
         img_w = self.display_image.width()
         img_h = self.display_image.height()
+        if img_w == 0 or img_h == 0:
+            return Point3D(0, 0, 0)
 
         scale_x = frame_rect.width() / img_w
         scale_y = frame_rect.height() / img_h
         scale = min(scale_x, scale_y) * self.zoom
+        if scale < 1e-10:
+            return Point3D(0, 0, 0)
 
         img_display_w = img_w * scale
         img_display_h = img_h * scale
@@ -487,6 +494,8 @@ class ViewportWidget(QWidget):
         frame_rect = self.image_frame.rect()
         img_w = self.display_image.width()
         img_h = self.display_image.height()
+        if img_w == 0 or img_h == 0:
+            return (0.0, 0.0)
 
         scale_x = frame_rect.width() / img_w
         scale_y = frame_rect.height() / img_h

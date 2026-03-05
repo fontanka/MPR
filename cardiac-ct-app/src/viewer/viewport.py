@@ -146,6 +146,18 @@ class ViewportWidget(QWidget):
         self.arm_rotate_initial_other_plane: Optional[ViewPlane] = None  # for locked rotation
         self.locked_rotation: bool = True  # RadiAnt-style: maintain 90° between axes
 
+        # Scroll speed multiplier
+        self.scroll_multiplier: int = 1
+
+        # Rotation throttle (cap at ~33fps to reduce CPU on weak machines)
+        from PySide6.QtCore import QTimer
+        self._rotation_throttle = QTimer()
+        self._rotation_throttle.setSingleShot(True)
+        self._rotation_throttle.setInterval(30)
+        self._rotation_throttle.timeout.connect(self._emit_pending_rotation)
+        self._pending_rotation: Optional[tuple] = None
+        self._pending_locked_rotation: Optional[tuple] = None
+
         # Polygon points for polygon tool
         self.polygon_points: List[Point3D] = []
 
@@ -1228,6 +1240,15 @@ class ViewportWidget(QWidget):
 
         super().mousePressEvent(event)
 
+    def _emit_pending_rotation(self):
+        """Emit throttled rotation updates."""
+        if self._pending_rotation:
+            self.arm_rotated.emit(*self._pending_rotation)
+            self._pending_rotation = None
+        if self._pending_locked_rotation:
+            self.arm_rotated.emit(*self._pending_locked_rotation)
+            self._pending_locked_rotation = None
+
     def _start_arm_rotation(self, event: QMouseEvent, arm_orient: str):
         """Start rotating an arm (linked viewport's plane)."""
         self.rotating_arm = arm_orient
@@ -1301,7 +1322,7 @@ class ViewportWidget(QWidget):
                 row_dir=new_row_dir / np.linalg.norm(new_row_dir)
             )
 
-            self.arm_rotated.emit(self.rotating_arm, new_plane)
+            self._pending_rotation = (self.rotating_arm, new_plane)
 
             # Locked rotation: also rotate the third plane to maintain 90° between axes
             if self.locked_rotation and self.arm_rotate_initial_other_plane:
@@ -1313,7 +1334,12 @@ class ViewportWidget(QWidget):
                     col_dir=new_col3 / np.linalg.norm(new_col3),
                     row_dir=new_row3 / np.linalg.norm(new_row3)
                 )
-                self.arm_rotated.emit(self._arm_rotate_third_orient, new_plane3)
+                self._pending_locked_rotation = (self._arm_rotate_third_orient, new_plane3)
+            else:
+                self._pending_locked_rotation = None
+
+            if not self._rotation_throttle.isActive():
+                self._rotation_throttle.start()
 
             return
 
@@ -1452,8 +1478,10 @@ class ViewportWidget(QWidget):
                 event.accept()
                 return
 
-            # End arm rotation
+            # End arm rotation — flush any pending throttled rotation
             if self.rotating_arm:
+                self._rotation_throttle.stop()
+                self._emit_pending_rotation()
                 self.rotating_arm = None
                 self.arm_rotate_center_screen = None
                 self.arm_rotate_initial_plane = None
@@ -1519,6 +1547,8 @@ class ViewportWidget(QWidget):
                 step_mm = spacing[0] * direction
             else:
                 step_mm = spacing[1] * direction
+
+        step_mm *= self.scroll_multiplier
 
         self.scroll_requested.emit(self.orientation, step_mm)
         event.accept()

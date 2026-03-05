@@ -10,10 +10,11 @@ from PySide6.QtWidgets import (
     QStatusBar, QFileDialog, QMessageBox, QLabel, QSlider,
     QSpinBox, QGroupBox, QDockWidget, QPushButton, QDialog,
     QFormLayout, QLineEdit, QDialogButtonBox, QSplitter, QListWidget,
-    QListWidgetItem, QProgressDialog, QApplication
+    QListWidgetItem, QProgressDialog, QApplication, QStyledItemDelegate,
+    QStyle
 )
 from PySide6.QtCore import Qt, QSize, QThread, Signal
-from PySide6.QtGui import QIcon, QKeySequence, QAction
+from PySide6.QtGui import QIcon, QKeySequence, QAction, QTextDocument, QColor
 from typing import Optional, List
 
 from .viewer.mpr_viewer import MPRViewer
@@ -151,27 +152,70 @@ class StudyInfoDialog(QDialog):
         )
 
 
+class SeriesItemDelegate(QStyledItemDelegate):
+    """Custom delegate to render rich HTML in series list items."""
+
+    def paint(self, painter, option, index):
+        painter.save()
+        # Draw selection/hover background
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(option.rect, QColor("#1976D2"))
+        elif option.state & QStyle.State_MouseOver:
+            painter.fillRect(option.rect, QColor("#3d3d3d"))
+
+        doc = QTextDocument()
+        doc.setDefaultStyleSheet("* { color: white; }")
+        html = index.data(Qt.UserRole + 1)
+        if html:
+            doc.setHtml(html)
+        else:
+            doc.setPlainText(index.data(Qt.DisplayRole) or "")
+        doc.setTextWidth(option.rect.width() - 16)
+
+        painter.translate(option.rect.left() + 8, option.rect.top() + 4)
+        doc.drawContents(painter)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        doc = QTextDocument()
+        html = index.data(Qt.UserRole + 1)
+        if html:
+            doc.setHtml(html)
+        else:
+            doc.setPlainText(index.data(Qt.DisplayRole) or "")
+        doc.setTextWidth(max(option.rect.width() - 16, 500))
+        return QSize(int(doc.idealWidth()) + 16, int(doc.size().height()) + 8)
+
+
 class SeriesSelectorDialog(QDialog):
     """Dialog for selecting a DICOM series when multiple are available."""
-    
-    def __init__(self, series_list: List[SeriesInfo], parent=None):
+
+    def __init__(self, series_list: List[SeriesInfo], annotation_service=None, parent=None):
         super().__init__(parent)
         self.series_list = series_list
+        self.annotation_service = annotation_service
         self.selected_series: Optional[SeriesInfo] = None
         self.setWindowTitle("Select DICOM Series")
         self.setMinimumSize(600, 400)
         self._setup_ui()
     
+    def _build_item_html(self, series: SeriesInfo) -> str:
+        """Build HTML for a series item, including annotation if present."""
+        annot = self.annotation_service.get(series.series_instance_uid) if self.annotation_service else ""
+        prefix = f'<b style="color: #81C784;">"{annot}"</b><br/>' if annot else ""
+        return prefix + series.get_display_html()
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        
+
         # Header
         header = QLabel(f"Found {len(self.series_list)} series. Please select one:")
         header.setStyleSheet("font-size: 14px; font-weight: bold; margin-bottom: 10px;")
         layout.addWidget(header)
-        
-        # Series list
+
+        # Series list with rich text delegate
         self.list_widget = QListWidget()
+        self.list_widget.setItemDelegate(SeriesItemDelegate())
         self.list_widget.setStyleSheet("""
             QListWidget {
                 background-color: #2d2d2d;
@@ -184,26 +228,40 @@ class SeriesSelectorDialog(QDialog):
                 color: white;
             }
             QListWidget::item:selected {
-                background-color: #1976D2;
+                background-color: transparent;
             }
             QListWidget::item:hover {
-                background-color: #3d3d3d;
+                background-color: transparent;
             }
         """)
-        
+
         for series in self.series_list:
             item = QListWidgetItem()
-            item.setText(series.get_display_text())
             item.setData(Qt.UserRole, series.series_instance_uid)
+            item.setData(Qt.UserRole + 1, self._build_item_html(series))
+            item.setSizeHint(QSize(0, 85))
             self.list_widget.addItem(item)
-        
+
         self.list_widget.itemDoubleClicked.connect(self._on_double_click)
+        self.list_widget.currentItemChanged.connect(self._on_series_selection_changed)
         layout.addWidget(self.list_widget)
-        
+
+        # Annotation edit
+        annot_layout = QHBoxLayout()
+        annot_layout.addWidget(QLabel("Custom Name:"))
+        self.annotation_edit = QLineEdit()
+        self.annotation_edit.setPlaceholderText("Enter a custom name for this series...")
+        self.annotation_edit.setStyleSheet("padding: 4px;")
+        annot_layout.addWidget(self.annotation_edit)
+        save_annot_btn = QPushButton("Save")
+        save_annot_btn.clicked.connect(self._save_annotation)
+        annot_layout.addWidget(save_annot_btn)
+        layout.addLayout(annot_layout)
+
         # Select first by default
         if self.series_list:
             self.list_widget.setCurrentRow(0)
-        
+
         # Buttons
         button_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
@@ -212,6 +270,26 @@ class SeriesSelectorDialog(QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
     
+    def _on_series_selection_changed(self, current, previous):
+        """Load annotation for newly selected series."""
+        if current and self.annotation_service:
+            uid = current.data(Qt.UserRole)
+            self.annotation_edit.setText(self.annotation_service.get(uid))
+        else:
+            self.annotation_edit.clear()
+
+    def _save_annotation(self):
+        """Save custom name for the currently selected series."""
+        current = self.list_widget.currentItem()
+        if current and self.annotation_service:
+            uid = current.data(Qt.UserRole)
+            self.annotation_service.set(uid, self.annotation_edit.text())
+            # Update display with new annotation
+            for series in self.series_list:
+                if series.series_instance_uid == uid:
+                    current.setData(Qt.UserRole + 1, self._build_item_html(series))
+                    break
+
     def _on_double_click(self, item: QListWidgetItem):
         """Handle double-click to select and close."""
         self._on_accept()
@@ -323,7 +401,21 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda checked, c=wc, w=ww: self._set_window_level(c, w))
             presets_layout.addWidget(btn)
         dock_layout.addLayout(presets_layout)
-        
+
+        # Scroll speed
+        scroll_layout = QHBoxLayout()
+        scroll_layout.addWidget(QLabel("Scroll Speed:"))
+        self.scroll_speed_spin = QSpinBox()
+        self.scroll_speed_spin.setRange(1, 10)
+        self.scroll_speed_spin.setValue(1)
+        self.scroll_speed_spin.setSuffix("x")
+        self.scroll_speed_spin.setToolTip("Slices per scroll notch (1-10)")
+        self.scroll_speed_spin.valueChanged.connect(
+            lambda v: self.mpr_viewer.set_scroll_multiplier(v)
+        )
+        scroll_layout.addWidget(self.scroll_speed_spin)
+        dock_layout.addLayout(scroll_layout)
+
         dock_layout.addStretch()
         dock.setWidget(dock_widget)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
@@ -608,10 +700,16 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Ready - Open a DICOM folder to begin")
             return
         
+        # Create annotation service for this folder
+        from .services.measurement_store import AnnotationService
+        self._annotation_service = AnnotationService()
+        if hasattr(self, '_pending_folder') and self._pending_folder:
+            self._annotation_service.set_workspace(self._pending_folder)
+
         # If multiple series, show selector
         series_uid = None
         if len(series_list) > 1:
-            dialog = SeriesSelectorDialog(series_list, self)
+            dialog = SeriesSelectorDialog(series_list, self._annotation_service, self)
             if dialog.exec() != QDialog.Accepted:
                 self.status_label.setText("Ready - Open a DICOM folder to begin")
                 return

@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from ..types.measurement import (
     Measurement, MeasurementStore, Point3D, PlaneDefinition,
     PatientInfo, StudyInfo
@@ -257,3 +257,48 @@ class MeasurementService:
         """Update study information."""
         self.store.study_info = study_info
         self._dirty = True
+
+
+class AnnotationService:
+    """Persists user-provided series annotations (custom names) in the workspace folder."""
+
+    FILENAME = "series_annotations.json"
+
+    def __init__(self):
+        self._annotations: Dict[str, str] = {}
+        self.workspace_path: Optional[str] = None
+
+    def set_workspace(self, folder_path: str):
+        self.workspace_path = folder_path
+        self._load()
+
+    def _get_filepath(self) -> Optional[str]:
+        if not self.workspace_path:
+            return None
+        return os.path.join(self.workspace_path, self.FILENAME)
+
+    def _load(self):
+        filepath = self._get_filepath()
+        if filepath and os.path.exists(filepath):
+            try:
+                with open(filepath, 'r') as f:
+                    self._annotations = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                self._annotations = {}
+
+    def save(self):
+        filepath = self._get_filepath()
+        if filepath:
+            Path(self.workspace_path).mkdir(parents=True, exist_ok=True)
+            with open(filepath, 'w') as f:
+                json.dump(self._annotations, f, indent=2)
+
+    def get(self, series_uid: str) -> str:
+        return self._annotations.get(series_uid, "")
+
+    def set(self, series_uid: str, name: str):
+        if name.strip():
+            self._annotations[series_uid] = name.strip()
+        elif series_uid in self._annotations:
+            del self._annotations[series_uid]
+        self.save()

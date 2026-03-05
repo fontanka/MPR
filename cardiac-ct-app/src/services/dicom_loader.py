@@ -90,6 +90,18 @@ class SeriesInfo:
             f"  Study: {self.study_description} ({self.study_date})"
         )
 
+    def get_display_html(self) -> str:
+        """Get rich HTML text for display in selector with highlighted slice count."""
+        return (
+            f'<b>Series {self.series_number}:</b> {self.series_description}<br/>'
+            f'<span style="color: #4FC3F7; font-size: 15px; font-weight: bold;">'
+            f'{self.num_slices} slices</span>'
+            f'<span style="color: #aaa;"> &nbsp;|&nbsp; {self.modality} &nbsp;|&nbsp; '
+            f'Thickness: {self.slice_thickness:.2f}mm</span><br/>'
+            f'<span style="color: #888;">{self.patient_name} &nbsp;|&nbsp; '
+            f'{self.study_description} ({self.study_date})</span>'
+        )
+
 
 def is_dicom_file_fast(file_path: str) -> bool:
     """
@@ -122,6 +134,7 @@ class DICOMLoader:
     def __init__(self):
         self.slices: List[Dataset] = []
         self.volume: Optional[np.ndarray] = None
+        self._volume_f32: Optional[np.ndarray] = None  # Cached float32 for oblique slicing
         self.spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
         self.origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.orientation: np.ndarray = np.eye(3)
@@ -489,6 +502,7 @@ class DICOMLoader:
                 continue
         
         self.volume = volume
+        self._volume_f32 = volume.astype(np.float32)
         print(f"Volume built: shape={volume.shape}, min={volume.min()}, max={volume.max()}")
     
     def get_volume_dimensions(self) -> Tuple[int, int, int]:
@@ -651,7 +665,7 @@ class DICOMLoader:
         coords = np.array([coords_i, coords_j, coords_k])
 
         result = map_coordinates(
-            self.volume.astype(np.float32),
+            self._volume_f32,
             coords,
             order=1,
             mode='constant',

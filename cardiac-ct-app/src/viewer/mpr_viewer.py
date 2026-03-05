@@ -275,8 +275,22 @@ class MPRViewer(QWidget):
         # Recompute intersection point as the intersection of all 3 planes
         self._recompute_intersection_point()
 
-        # Update all viewports
-        self._update_all_viewports()
+        # Selective update: full re-slice only for scrolled viewport,
+        # others just repaint crosshairs (reuse cached pixmap)
+        for vp in self._viewports():
+            vp.set_mpr_state(self.mpr_state)
+            vp_plane = self.mpr_state.planes[vp.orientation]
+            slice_idx = self._plane_origin_to_slice(vp.orientation, vp_plane.origin)
+            if slice_idx is not None:
+                vp.current_slice = max(0, min(slice_idx, vp.max_slice))
+                vp.slice_slider.blockSignals(True)
+                vp.slice_slider.setValue(vp.current_slice)
+                vp.slice_slider.blockSignals(False)
+
+            if vp.orientation == orientation:
+                vp._update_display()  # Full re-slice for scrolled viewport
+            else:
+                vp.update()  # Crosshair-only repaint for others
 
         # Emit slice_changed for status bar
         vp = self._get_viewport(orientation)
@@ -501,6 +515,12 @@ class MPRViewer(QWidget):
         """Set locked rotation mode (90° between axes) for all viewports."""
         for vp in self._viewports():
             vp.locked_rotation = locked
+
+    def set_scroll_multiplier(self, value: int):
+        """Set scroll speed multiplier for all viewports."""
+        value = max(1, min(10, value))
+        for vp in self._viewports():
+            vp.scroll_multiplier = value
 
     @property
     def selected_measurement(self) -> Optional[Measurement]:

@@ -476,13 +476,15 @@ class ViewportWidget(QWidget):
             y = origin[1] + img_y * spacing[1]
             z = origin[2] + self.current_slice * spacing[2]
         elif self.orientation == 'sagittal':
+            # After Z-axis resampling, each vertical pixel = y_spacing mm
             x = origin[0] + self.current_slice * spacing[0]
             y = origin[1] + img_x * spacing[1]
-            z = origin[2] + (img_h - img_y) * spacing[2]
+            z = origin[2] + (img_h - img_y) * spacing[1]
         else:  # coronal
+            # After Z-axis resampling, each vertical pixel = x_spacing mm
             x = origin[0] + img_x * spacing[0]
             y = origin[1] + self.current_slice * spacing[1]
-            z = origin[2] + (img_h - img_y) * spacing[2]
+            z = origin[2] + (img_h - img_y) * spacing[0]
 
         return Point3D(x, y, z)
 
@@ -521,11 +523,13 @@ class ViewportWidget(QWidget):
                 img_x = (patient_pt[0] - origin[0]) / spacing[0]
                 img_y = (patient_pt[1] - origin[1]) / spacing[1]
             elif self.orientation == 'sagittal':
+                # After Z-axis resampling, each vertical pixel = y_spacing mm
                 img_x = (patient_pt[1] - origin[1]) / spacing[1]
-                img_y = self.display_image.height() - (patient_pt[2] - origin[2]) / spacing[2]
+                img_y = self.display_image.height() - (patient_pt[2] - origin[2]) / spacing[1]
             else:
+                # After Z-axis resampling, each vertical pixel = x_spacing mm
                 img_x = (patient_pt[0] - origin[0]) / spacing[0]
-                img_y = self.display_image.height() - (patient_pt[2] - origin[2]) / spacing[2]
+                img_y = self.display_image.height() - (patient_pt[2] - origin[2]) / spacing[0]
 
         sx = offset_x + img_x * scale + self.image_frame.x()
         sy = offset_y + img_y * scale + self.image_frame.y()
@@ -673,15 +677,17 @@ class ViewportWidget(QWidget):
                 d_u = line_dir_3d[0] / spacing[0]
                 d_v = line_dir_3d[1] / spacing[1]
             elif self.orientation == 'sagittal':
+                # After Z-axis resampling, each vertical pixel = y_spacing mm
                 p_u = (p_3d[1] - origin_arr[1]) / spacing[1]
-                p_v = row_count - (p_3d[2] - origin_arr[2]) / spacing[2]
+                p_v = row_count - (p_3d[2] - origin_arr[2]) / spacing[1]
                 d_u = line_dir_3d[1] / spacing[1]
-                d_v = -line_dir_3d[2] / spacing[2]
+                d_v = -line_dir_3d[2] / spacing[1]
             else:  # coronal
+                # After Z-axis resampling, each vertical pixel = x_spacing mm
                 p_u = (p_3d[0] - origin_arr[0]) / spacing[0]
-                p_v = row_count - (p_3d[2] - origin_arr[2]) / spacing[2]
+                p_v = row_count - (p_3d[2] - origin_arr[2]) / spacing[0]
                 d_u = line_dir_3d[0] / spacing[0]
-                d_v = -line_dir_3d[2] / spacing[2]
+                d_v = -line_dir_3d[2] / spacing[0]
         else:
             return None
 

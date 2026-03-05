@@ -451,6 +451,8 @@ class MPRViewer(QWidget):
         """Navigate to the plane where a measurement was taken."""
         if not self.loader or not measurement.plane or not self.mpr_state:
             return
+        if not measurement.points:
+            return
 
         center = Point3D(
             x=sum(p.x for p in measurement.points) / len(measurement.points),

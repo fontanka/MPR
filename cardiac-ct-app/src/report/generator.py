@@ -167,7 +167,7 @@ class ReportGenerator:
                     field_data = [['Measurement', 'Plane', 'Value']]
                     for field in fields:
                         value = measurement_lookup.get(field.id, 'NA')
-                        if value != 'NA':
+                        if value != 'NA' and isinstance(value, (int, float)):
                             value = f"{value:.1f} mm"
                         field_data.append([
                             field.name,

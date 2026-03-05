@@ -498,7 +498,7 @@ class ViewportWidget(QWidget):
         offset_y = (frame_rect.height() - img_display_h) / 2 + self.pan_offset.y()
 
         if self._is_oblique() and self.view_plane:
-            px_sp = self._oblique_pixel_spacing
+            px_sp = self._oblique_pixel_spacing if self._oblique_pixel_spacing > 0 else 1.0
             col_count = self._oblique_col_count
             row_count = self._oblique_row_count
             delta = patient_pt - self.view_plane.origin
@@ -801,8 +801,6 @@ class ViewportWidget(QWidget):
                 try:
                     x = [p.x() for p in pts_screen]
                     y = [p.y() for p in pts_screen]
-                    x.append(x[0])
-                    y.append(y[0])
 
                     tck, u = splprep([x, y], s=0, per=True)
                     num_segments = len(pts_screen)
@@ -1316,10 +1314,14 @@ class ViewportWidget(QWidget):
             new_col_dir = rotate_vector(init.col_dir, my_normal, delta_angle)
             new_row_dir = rotate_vector(init.row_dir, my_normal, delta_angle)
 
+            norm_col = np.linalg.norm(new_col_dir)
+            norm_row = np.linalg.norm(new_row_dir)
+            if norm_col < 1e-10 or norm_row < 1e-10:
+                return
             new_plane = ViewPlane(
                 origin=self.mpr_state.intersection_point.copy(),
-                col_dir=new_col_dir / np.linalg.norm(new_col_dir),
-                row_dir=new_row_dir / np.linalg.norm(new_row_dir)
+                col_dir=new_col_dir / norm_col,
+                row_dir=new_row_dir / norm_row
             )
 
             self._pending_rotation = (self.rotating_arm, new_plane)
@@ -1329,10 +1331,14 @@ class ViewportWidget(QWidget):
                 init3 = self.arm_rotate_initial_other_plane
                 new_col3 = rotate_vector(init3.col_dir, my_normal, delta_angle)
                 new_row3 = rotate_vector(init3.row_dir, my_normal, delta_angle)
+                norm_col3 = np.linalg.norm(new_col3)
+                norm_row3 = np.linalg.norm(new_row3)
+                if norm_col3 < 1e-10 or norm_row3 < 1e-10:
+                    return
                 new_plane3 = ViewPlane(
                     origin=self.mpr_state.intersection_point.copy(),
-                    col_dir=new_col3 / np.linalg.norm(new_col3),
-                    row_dir=new_row3 / np.linalg.norm(new_row3)
+                    col_dir=new_col3 / norm_col3,
+                    row_dir=new_row3 / norm_row3
                 )
                 self._pending_locked_rotation = (self._arm_rotate_third_orient, new_plane3)
             else:

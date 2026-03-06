@@ -134,12 +134,15 @@ class DICOMLoader:
     def __init__(self):
         self.slices: List[Dataset] = []
         self.volume: Optional[np.ndarray] = None
-        self._volume_f32: Optional[np.ndarray] = None  # Deprecated: kept for compat, use volume directly
         self._sagittal_volume: Optional[np.ndarray] = None  # Z-resampled for sagittal
         self._coronal_volume: Optional[np.ndarray] = None   # Z-resampled for coronal
         self.spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
         self.origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.orientation: np.ndarray = np.eye(3)
+        self._inv_orient_cache: Optional[np.ndarray] = None
+        self._corners_cache: Optional[list] = None
+        self._origin_arr: np.ndarray = np.asarray(self.origin, dtype=np.float64)
+        self._wl_lut_cache: tuple = (None, None)
         
         # DICOM identifiers
         self.study_instance_uid: str = ""
@@ -504,12 +507,16 @@ class DICOMLoader:
                 continue
         
         self.volume = volume
-        self._volume_f32 = None  # No longer pre-allocating float32 copy; map_coordinates works on int16
         # Invalidate cached transforms (they depend on volume shape)
         self._inv_orient_cache = None
         self._corners_cache = None
         self._origin_arr = np.asarray(self.origin, dtype=np.float64)
         print(f"Volume built: shape={volume.shape}, min={volume.min()}, max={volume.max()}")
+
+        # Free pixel data from DICOM datasets to reclaim ~150MB
+        for ds in self.slices:
+            if hasattr(ds, 'PixelData'):
+                del ds.PixelData
 
         # Pre-compute resampled volumes for sagittal/coronal
         # Eliminates per-slice scipy.ndimage.zoom (the single most expensive axis-aligned op)
@@ -536,43 +543,36 @@ class DICOMLoader:
         z_spacing = self.spacing[2]
         y_spacing = self.spacing[1]
         x_spacing = self.spacing[0]
-        num_z = self.volume.shape[0]
 
         try:
             from scipy.ndimage import zoom as ndizoom
 
             # Sagittal: resample Z so each pixel = y_spacing mm
-            if z_spacing > 0 and y_spacing > 0:
-                sag_scale = z_spacing / y_spacing
-                if abs(sag_scale - 1.0) > 0.01:
-                    self._report_progress(0, 2, "Resampling volume for sagittal view...")
-                    # volume shape is (Z, Y, X) — sagittal slices are volume[:, :, x]
-                    # We resample along axis 0 (Z) so each Z pixel = y_spacing
-                    self._sagittal_volume = ndizoom(
-                        self.volume, (sag_scale, 1.0, 1.0), order=1
-                    ).astype(np.int16)
-                    print(f"Sagittal resampled volume: {self._sagittal_volume.shape} (scale Z x{sag_scale:.2f})")
-                else:
-                    self._sagittal_volume = self.volume  # no resampling needed
+            sag_scale = (z_spacing / y_spacing) if (z_spacing > 0 and y_spacing > 0) else 1.0
+            if abs(sag_scale - 1.0) > 0.01:
+                self._report_progress(0, 2, "Resampling volume for sagittal view...")
+                self._sagittal_volume = np.clip(
+                    ndizoom(self.volume, (sag_scale, 1.0, 1.0), order=1),
+                    -32768, 32767
+                ).astype(np.int16)
+                print(f"Sagittal resampled volume: {self._sagittal_volume.shape} (scale Z x{sag_scale:.2f})")
             else:
                 self._sagittal_volume = self.volume
 
             # Coronal: resample Z so each pixel = x_spacing mm
-            if z_spacing > 0 and x_spacing > 0:
-                cor_scale = z_spacing / x_spacing
-                if abs(cor_scale - 1.0) > 0.01:
-                    self._report_progress(1, 2, "Resampling volume for coronal view...")
-                    # If sagittal and coronal need same scale, reuse
-                    if abs(cor_scale - sag_scale) < 0.01 and self._sagittal_volume is not self.volume:
-                        self._coronal_volume = self._sagittal_volume
-                        print(f"Coronal resampled volume: reusing sagittal (same scale)")
-                    else:
-                        self._coronal_volume = ndizoom(
-                            self.volume, (cor_scale, 1.0, 1.0), order=1
-                        ).astype(np.int16)
-                        print(f"Coronal resampled volume: {self._coronal_volume.shape} (scale Z x{cor_scale:.2f})")
+            cor_scale = (z_spacing / x_spacing) if (z_spacing > 0 and x_spacing > 0) else 1.0
+            if abs(cor_scale - 1.0) > 0.01:
+                self._report_progress(1, 2, "Resampling volume for coronal view...")
+                # If sagittal and coronal need same scale, reuse
+                if abs(cor_scale - sag_scale) < 0.01 and self._sagittal_volume is not self.volume:
+                    self._coronal_volume = self._sagittal_volume
+                    print(f"Coronal resampled volume: reusing sagittal (same scale)")
                 else:
-                    self._coronal_volume = self.volume
+                    self._coronal_volume = np.clip(
+                        ndizoom(self.volume, (cor_scale, 1.0, 1.0), order=1),
+                        -32768, 32767
+                    ).astype(np.int16)
+                    print(f"Coronal resampled volume: {self._coronal_volume.shape} (scale Z x{cor_scale:.2f})")
             else:
                 self._coronal_volume = self.volume
 
@@ -601,7 +601,7 @@ class DICOMLoader:
     
     def patient_to_index(self, x: float, y: float, z: float) -> Tuple[int, int, int]:
         patient = np.array([x, y, z])
-        local = np.linalg.inv(self.orientation) @ (patient - np.array(self.origin))
+        local = self._get_inv_orientation() @ (patient - self._origin_arr)
         k = int(round(local[0] / self.spacing[0]))
         j = int(round(local[1] / self.spacing[1]))
         i = int(round(local[2] / self.spacing[2]))
@@ -799,7 +799,7 @@ class DICOMLoader:
 
         # LUT path for int16 (standard axis-aligned slices)
         if image.dtype == np.int16:
-            lut_key = (int(min_val * 10), int(max_val * 10))
+            lut_key = (round(min_val * 10), round(max_val * 10))
             cached = getattr(self, '_wl_lut_cache', (None, None))
             if cached[0] == lut_key:
                 lut = cached[1]

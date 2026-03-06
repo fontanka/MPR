@@ -41,21 +41,32 @@ class ViewPlane:
     col_dir: np.ndarray  # Unit vector: screen-right direction
     row_dir: np.ndarray  # Unit vector: screen-down direction
 
+    def __post_init__(self):
+        self._normal: Optional[np.ndarray] = None
+        self._axis_aligned: Optional[bool] = None
+
+    def _invalidate(self):
+        """Call after mutating col_dir or row_dir."""
+        self._normal = None
+        self._axis_aligned = None
+
     @property
     def normal(self) -> np.ndarray:
-        """Normal vector (into screen) = col_dir x row_dir."""
-        n = np.cross(self.col_dir, self.row_dir)
-        norm = np.linalg.norm(n)
-        return n / norm if norm > 1e-10 else np.array([0.0, 0.0, 1.0])
+        """Normal vector (into screen) = col_dir x row_dir. Cached until invalidated."""
+        if self._normal is None:
+            n = np.cross(self.col_dir, self.row_dir)
+            norm = np.linalg.norm(n)
+            self._normal = n / norm if norm > 1e-10 else np.array([0.0, 0.0, 1.0])
+        return self._normal
 
     def is_axis_aligned(self, tol: float = 0.01) -> bool:
-        """Check if plane is close to a standard axis-aligned orientation."""
-        n = self.normal
-        for axis in [np.array([1,0,0]), np.array([0,1,0]), np.array([0,0,1]),
-                     np.array([-1,0,0]), np.array([0,-1,0]), np.array([0,0,-1])]:
-            if np.linalg.norm(n - axis) < tol:
-                return True
-        return False
+        """Check if plane is close to a standard axis-aligned orientation. Cached."""
+        if self._axis_aligned is None:
+            n = self.normal
+            # Fast check: one component near ±1, others near 0
+            abs_n = np.abs(n)
+            self._axis_aligned = bool(np.max(abs_n) > (1.0 - tol))
+        return self._axis_aligned
 
     def copy(self) -> 'ViewPlane':
         return ViewPlane(self.origin.copy(), self.col_dir.copy(), self.row_dir.copy())
@@ -545,9 +556,11 @@ class ViewportWidget(QWidget):
 
         # Build a key from the values that affect the transform
         frame_rect = self.image_frame.rect()
+        vp_key = (self.view_plane.origin.tobytes(), self.view_plane.col_dir.tobytes(),
+                  self.view_plane.row_dir.tobytes()) if self.view_plane else None
         key = (frame_rect.width(), frame_rect.height(), img_w, img_h,
                self.zoom, self.pan_offset.x(), self.pan_offset.y(),
-               self.orientation, self.current_slice, id(self.view_plane))
+               self.orientation, self.current_slice, vp_key)
 
         cached = getattr(self, '_transform_cache', None)
         if cached is not None and cached.get('_key') == key:
@@ -2034,4 +2047,4 @@ class ViewportWidget(QWidget):
         """Set window/level values."""
         self.window_center = center
         self.window_width = width
-        self._update_display()
+        self._update_display(wl_only=True)

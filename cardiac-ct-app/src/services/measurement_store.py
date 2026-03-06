@@ -188,24 +188,25 @@ class MeasurementService:
         Returns:
             True if successful
         """
-        # 1. Clear existing assignment for this field
+        # 1. Find target measurement first (before mutating anything)
+        target = None
+        for m in self.store.measurements:
+            if m.id == measurement_id:
+                target = m
+                break
+
+        if target is None:
+            return False
+
+        # 2. Clear existing assignment for this field
         for m in self.store.measurements:
             if m.protocol_field_id == protocol_field_id and m.id != measurement_id:
                 m.protocol_field_id = ""
-        
-        # 2. Assign new measurement
-        found = False
-        for m in self.store.measurements:
-            if m.id == measurement_id:
-                m.protocol_field_id = protocol_field_id
-                found = True
-                break
-        
-        if found:
-            self._dirty = True
-            return self.save()
-            
-        return False
+
+        # 3. Assign new measurement
+        target.protocol_field_id = protocol_field_id
+        self._dirty = True
+        return self.save()
 
     def unassign_field(self, protocol_field_id: str) -> bool:
         """

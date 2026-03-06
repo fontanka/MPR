@@ -176,8 +176,13 @@ class MPRViewer(QWidget):
 
     # ─── Central State Update ───
 
-    def _update_all_viewports(self):
-        """Push MPRState to all viewports, derive slice indices, trigger repaint."""
+    def _update_all_viewports(self, reslice_only: set = None):
+        """Push MPRState to all viewports, derive slice indices, trigger repaint.
+
+        Args:
+            reslice_only: If provided, only do full re-slice for these orientations.
+                         Other viewports just get state + repaint (crosshair update).
+        """
         if not self.mpr_state or not self.loader:
             return
 
@@ -193,7 +198,10 @@ class MPRViewer(QWidget):
                 vp.slice_slider.setValue(vp.current_slice)
                 vp.slice_slider.blockSignals(False)
 
-            vp._update_display()
+            if reslice_only is None or vp.orientation in reslice_only:
+                vp._update_display()
+            else:
+                vp.update()  # repaint only (crosshair + measurements)
 
     def _plane_origin_to_slice(self, orientation: str, origin: np.ndarray) -> Optional[int]:
         """Convert a plane origin to a slice index for the given orientation."""
@@ -236,7 +244,13 @@ class MPRViewer(QWidget):
         for orient, plane in self.mpr_state.planes.items():
             plane.origin = new_point.copy()
 
-        self._update_all_viewports()
+        # Source viewport only needs crosshair repaint; other two need re-slicing
+        source = self.sender()
+        source_orient = getattr(source, 'orientation', None)
+        others = {'axial', 'sagittal', 'coronal'}
+        if source_orient:
+            others.discard(source_orient)
+        self._update_all_viewports(reslice_only=others)
 
     def _on_arm_rotated(self, target_orientation: str, new_plane):
         """Handle arm rotation: update the target viewport's plane."""
@@ -248,7 +262,8 @@ class MPRViewer(QWidget):
         # Ensure origin stays at intersection point
         new_plane.origin = self.mpr_state.intersection_point.copy()
 
-        self._update_all_viewports()
+        # Only the target viewport needs re-slicing; others just update crosshair
+        self._update_all_viewports(reslice_only={target_orientation})
 
     def _on_scroll_requested(self, orientation: str, delta_mm: float):
         """Handle scroll: move the scrolled viewport's plane along its normal."""
@@ -364,6 +379,8 @@ class MPRViewer(QWidget):
 
     def _on_measurement_assigned_from_viewport(self, measurement: Measurement, field_id: str):
         """Handle measurement assignment from a viewport."""
+        if not self.measurement_service:
+            return
         if self.measurement_service.assign_measurement(measurement.id, field_id):
             self._update_measurements_display()
             self.measurement_assigned.emit(measurement, field_id)
@@ -490,7 +507,10 @@ class MPRViewer(QWidget):
 
     def _on_window_level_changed_from_viewport(self, center: float, width: float):
         """Sync window/level from one viewport's drag to all viewports and app."""
+        source = self.sender()
         for vp in self._viewports():
+            if vp is source:
+                continue  # Source already updated itself before emitting
             vp.window_center = center
             vp.window_width = width
             if vp.display_image is not None:

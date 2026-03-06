@@ -134,7 +134,9 @@ class DICOMLoader:
     def __init__(self):
         self.slices: List[Dataset] = []
         self.volume: Optional[np.ndarray] = None
-        self._volume_f32: Optional[np.ndarray] = None  # Cached float32 for oblique slicing
+        self._volume_f32: Optional[np.ndarray] = None  # Deprecated: kept for compat, use volume directly
+        self._sagittal_volume: Optional[np.ndarray] = None  # Z-resampled for sagittal
+        self._coronal_volume: Optional[np.ndarray] = None   # Z-resampled for coronal
         self.spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
         self.origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.orientation: np.ndarray = np.eye(3)
@@ -502,9 +504,83 @@ class DICOMLoader:
                 continue
         
         self.volume = volume
-        self._volume_f32 = volume.astype(np.float32)
+        self._volume_f32 = None  # No longer pre-allocating float32 copy; map_coordinates works on int16
+        # Invalidate cached transforms (they depend on volume shape)
+        self._inv_orient_cache = None
+        self._corners_cache = None
+        self._origin_arr = np.asarray(self.origin, dtype=np.float64)
         print(f"Volume built: shape={volume.shape}, min={volume.min()}, max={volume.max()}")
-    
+
+        # Pre-compute resampled volumes for sagittal/coronal
+        # Eliminates per-slice scipy.ndimage.zoom (the single most expensive axis-aligned op)
+        self._build_resampled_volumes()
+
+    def _build_resampled_volumes(self):
+        """
+        Pre-compute Z-resampled volumes for sagittal and coronal views.
+
+        Instead of calling scipy.ndimage.zoom on every single slice extraction,
+        we resample the entire volume along Z once at load time. This turns O(N)
+        zoom calls into O(1) array indexing during scroll/interaction.
+
+        Memory: adds ~2x volume size (one resampled copy per orientation).
+        For a typical 512x512x300 int16 volume (~150MB), each resampled volume
+        is ~375MB (512x512x750 for 2.5:1 ratio). Total extra: ~750MB.
+        For machines with limited RAM, we fall back to per-slice zoom.
+        """
+        if self.volume is None:
+            self._sagittal_volume = None
+            self._coronal_volume = None
+            return
+
+        z_spacing = self.spacing[2]
+        y_spacing = self.spacing[1]
+        x_spacing = self.spacing[0]
+        num_z = self.volume.shape[0]
+
+        try:
+            from scipy.ndimage import zoom as ndizoom
+
+            # Sagittal: resample Z so each pixel = y_spacing mm
+            if z_spacing > 0 and y_spacing > 0:
+                sag_scale = z_spacing / y_spacing
+                if abs(sag_scale - 1.0) > 0.01:
+                    self._report_progress(0, 2, "Resampling volume for sagittal view...")
+                    # volume shape is (Z, Y, X) — sagittal slices are volume[:, :, x]
+                    # We resample along axis 0 (Z) so each Z pixel = y_spacing
+                    self._sagittal_volume = ndizoom(
+                        self.volume, (sag_scale, 1.0, 1.0), order=1
+                    ).astype(np.int16)
+                    print(f"Sagittal resampled volume: {self._sagittal_volume.shape} (scale Z x{sag_scale:.2f})")
+                else:
+                    self._sagittal_volume = self.volume  # no resampling needed
+            else:
+                self._sagittal_volume = self.volume
+
+            # Coronal: resample Z so each pixel = x_spacing mm
+            if z_spacing > 0 and x_spacing > 0:
+                cor_scale = z_spacing / x_spacing
+                if abs(cor_scale - 1.0) > 0.01:
+                    self._report_progress(1, 2, "Resampling volume for coronal view...")
+                    # If sagittal and coronal need same scale, reuse
+                    if abs(cor_scale - sag_scale) < 0.01 and self._sagittal_volume is not self.volume:
+                        self._coronal_volume = self._sagittal_volume
+                        print(f"Coronal resampled volume: reusing sagittal (same scale)")
+                    else:
+                        self._coronal_volume = ndizoom(
+                            self.volume, (cor_scale, 1.0, 1.0), order=1
+                        ).astype(np.int16)
+                        print(f"Coronal resampled volume: {self._coronal_volume.shape} (scale Z x{cor_scale:.2f})")
+                else:
+                    self._coronal_volume = self.volume
+            else:
+                self._coronal_volume = self.volume
+
+        except MemoryError:
+            print("WARNING: Not enough memory for pre-resampled volumes, falling back to per-slice zoom")
+            self._sagittal_volume = None
+            self._coronal_volume = None
+
     def get_volume_dimensions(self) -> Tuple[int, int, int]:
         if self.volume is None:
             return (0, 0, 0)
@@ -540,17 +616,19 @@ class DICOMLoader:
         """Get sagittal slice with proper aspect ratio."""
         if self.volume is None or x_index < 0 or x_index >= self.volume.shape[2]:
             return None
-        
-        # Get the raw slice (Z, Y) shape
+
+        # Use pre-resampled volume if available (fast path)
+        sag_vol = getattr(self, '_sagittal_volume', None)
+        if sag_vol is not None:
+            if x_index >= sag_vol.shape[2]:
+                return None
+            return sag_vol[:, :, x_index]
+
+        # Fallback: per-slice zoom (used when memory was insufficient)
         raw_slice = self.volume[:, :, x_index]
-        
-        # Resample Z axis to match physical aspect ratio with Y
-        # Physical Z extent = num_z * z_spacing
-        # Physical Y extent = num_y * y_spacing
-        # For proper display, resample Z to have same mm/pixel as Y
         num_z, num_y = raw_slice.shape
-        z_spacing = self.spacing[2]  # mm per Z slice
-        y_spacing = self.spacing[1]  # mm per Y pixel (row_spacing)
+        z_spacing = self.spacing[2]
+        y_spacing = self.spacing[1]
 
         if z_spacing > 0 and y_spacing > 0:
             target_z = int(num_z * z_spacing / y_spacing)
@@ -558,21 +636,26 @@ class DICOMLoader:
                 from scipy.ndimage import zoom
                 scale = target_z / num_z
                 raw_slice = zoom(raw_slice, (scale, 1.0), order=1)
-        
+
         return raw_slice
     
     def get_coronal_slice(self, y_index: int) -> Optional[np.ndarray]:
         """Get coronal slice with proper aspect ratio."""
         if self.volume is None or y_index < 0 or y_index >= self.volume.shape[1]:
             return None
-        
-        # Get the raw slice (Z, X) shape
+
+        # Use pre-resampled volume if available (fast path)
+        cor_vol = getattr(self, '_coronal_volume', None)
+        if cor_vol is not None:
+            if y_index >= cor_vol.shape[1]:
+                return None
+            return cor_vol[:, y_index, :]
+
+        # Fallback: per-slice zoom (used when memory was insufficient)
         raw_slice = self.volume[:, y_index, :]
-        
-        # Resample Z axis to match physical aspect ratio with X
         num_z, num_x = raw_slice.shape
-        z_spacing = self.spacing[2]  # mm per Z slice
-        x_spacing = self.spacing[0]  # mm per X pixel (col_spacing)
+        z_spacing = self.spacing[2]
+        x_spacing = self.spacing[0]
 
         if z_spacing > 0 and x_spacing > 0:
             target_z = int(num_z * z_spacing / x_spacing)
@@ -580,9 +663,39 @@ class DICOMLoader:
                 from scipy.ndimage import zoom
                 scale = target_z / num_z
                 raw_slice = zoom(raw_slice, (scale, 1.0), order=1)
-        
+
         return raw_slice
     
+    def _get_inv_orientation(self) -> np.ndarray:
+        """Cached inverse orientation matrix."""
+        cached = getattr(self, '_inv_orient_cache', None)
+        if cached is None:
+            cached = np.linalg.inv(self.orientation)
+            self._inv_orient_cache = cached
+            self._origin_arr = np.asarray(self.origin, dtype=np.float64)
+        return cached
+
+    def _get_volume_corners(self) -> list:
+        """Cached volume corners in patient space."""
+        cached = getattr(self, '_corners_cache', None)
+        if cached is not None:
+            return cached
+        if self.volume is None:
+            return []
+        dims = self.volume.shape
+        spacing = self.spacing
+        origin = np.asarray(self.origin)
+        corners = []
+        for iz in [0, dims[0] - 1]:
+            for iy in [0, dims[1] - 1]:
+                for ix in [0, dims[2] - 1]:
+                    local = np.array([
+                        ix * spacing[0], iy * spacing[1], iz * spacing[2]
+                    ])
+                    corners.append(self.orientation @ local + origin)
+        self._corners_cache = corners
+        return corners
+
     def get_oblique_slice_patient(self, center_patient: np.ndarray,
                                   col_dir: np.ndarray, row_dir: np.ndarray,
                                   col_count: int = 0, row_count: int = 0
@@ -600,28 +713,22 @@ class DICOMLoader:
         Returns:
             Tuple of (slice_data as np.ndarray, pixel_spacing as float), or None
         """
-        if self.volume is None or self._volume_f32 is None:
+        if self.volume is None:
             return None
 
         from scipy.ndimage import map_coordinates
 
-        inv_orient = np.linalg.inv(self.orientation)
-        origin = np.array(self.origin)
+        # Use cached inverse orientation and origin array
+        inv_orient = self._get_inv_orientation()
+        origin = self._origin_arr
         spacing = np.array(self.spacing)  # (x_sp, y_sp, z_sp)
         dims = self.volume.shape  # (Z, Y, X)
         pixel_spacing = min(self.spacing)
 
         # Auto-compute output size from volume extent projected onto plane
         if col_count <= 0 or row_count <= 0:
-            # Compute volume corners in patient space
-            corners = []
-            for iz in [0, dims[0] - 1]:
-                for iy in [0, dims[1] - 1]:
-                    for ix in [0, dims[2] - 1]:
-                        local = np.array([
-                            ix * spacing[0], iy * spacing[1], iz * spacing[2]
-                        ])
-                        corners.append(self.orientation @ local + origin)
+            # Use cached patient-space corners
+            corners = self._get_volume_corners()
 
             # Project corners onto plane directions
             col_proj = [np.dot(c - center_patient, col_dir) for c in corners]
@@ -665,11 +772,12 @@ class DICOMLoader:
         coords = np.array([coords_i, coords_j, coords_k])
 
         result = map_coordinates(
-            self._volume_f32,
+            self.volume,
             coords,
             order=1,
             mode='constant',
-            cval=-1024
+            cval=-1024,
+            output=np.float32
         )
 
         return result.astype(np.int16), pixel_spacing

@@ -534,16 +534,24 @@ class ViewportWidget(QWidget):
 
         return Point3D(x, y, z)
 
-    def _patient_to_screen_f(self, patient_pt: np.ndarray) -> Tuple[float, float]:
-        """Convert patient 3D point to screen coordinates (float precision)."""
+    def _get_transform_cache(self) -> Optional[dict]:
+        """Get cached display-transform params; recomputed only when inputs change."""
         if not self.loader or self.display_image is None:
-            return (0.0, 0.0)
-
-        frame_rect = self.image_frame.rect()
+            return None
         img_w = self.display_image.width()
         img_h = self.display_image.height()
         if img_w == 0 or img_h == 0:
-            return (0.0, 0.0)
+            return None
+
+        # Build a key from the values that affect the transform
+        frame_rect = self.image_frame.rect()
+        key = (frame_rect.width(), frame_rect.height(), img_w, img_h,
+               self.zoom, self.pan_offset.x(), self.pan_offset.y(),
+               self.orientation, self.current_slice, id(self.view_plane))
+
+        cached = getattr(self, '_transform_cache', None)
+        if cached is not None and cached.get('_key') == key:
+            return cached
 
         scale_x = frame_rect.width() / img_w
         scale_y = frame_rect.height() / img_h
@@ -551,40 +559,122 @@ class ViewportWidget(QWidget):
 
         img_display_w = img_w * scale
         img_display_h = img_h * scale
-        offset_x = (frame_rect.width() - img_display_w) / 2 + self.pan_offset.x()
-        offset_y = (frame_rect.height() - img_display_h) / 2 + self.pan_offset.y()
+        base_x = (frame_rect.width() - img_display_w) / 2 + self.pan_offset.x() + self.image_frame.x()
+        base_y = (frame_rect.height() - img_display_h) / 2 + self.pan_offset.y() + self.image_frame.y()
+
+        tc = {
+            '_key': key,
+            'scale': scale,
+            'base_x': base_x,
+            'base_y': base_y,
+            'img_h': img_h,
+        }
 
         if self._is_oblique() and self.view_plane:
-            px_sp = self._oblique_pixel_spacing if self._oblique_pixel_spacing > 0 else 1.0
-            col_count = self._oblique_col_count
-            row_count = self._oblique_row_count
-            delta = patient_pt - self.view_plane.origin
-            img_x = np.dot(delta, self.view_plane.col_dir) / px_sp + col_count / 2.0
-            img_y = np.dot(delta, self.view_plane.row_dir) / px_sp + row_count / 2.0
+            tc['oblique'] = True
+            tc['px_sp'] = self._oblique_pixel_spacing if self._oblique_pixel_spacing > 0 else 1.0
+            tc['col_half'] = self._oblique_col_count / 2.0
+            tc['row_half'] = self._oblique_row_count / 2.0
+            tc['vp_origin'] = self.view_plane.origin
+            tc['col_dir'] = self.view_plane.col_dir
+            tc['row_dir'] = self.view_plane.row_dir
         else:
-            spacing = self.loader.spacing
-            origin = self.loader.origin
+            tc['oblique'] = False
+            tc['spacing'] = self.loader.spacing
+            tc['origin'] = self.loader.origin
+
+        self._transform_cache = tc
+        return tc
+
+    def _patient_to_screen_f(self, patient_pt: np.ndarray) -> Tuple[float, float]:
+        """Convert patient 3D point to screen coordinates (float precision)."""
+        tc = self._get_transform_cache()
+        if tc is None:
+            return (0.0, 0.0)
+
+        scale = tc['scale']
+
+        if tc['oblique']:
+            delta = patient_pt - tc['vp_origin']
+            img_x = np.dot(delta, tc['col_dir']) / tc['px_sp'] + tc['col_half']
+            img_y = np.dot(delta, tc['row_dir']) / tc['px_sp'] + tc['row_half']
+        else:
+            spacing = tc['spacing']
+            origin = tc['origin']
 
             if self.orientation == 'axial':
                 img_x = (patient_pt[0] - origin[0]) / spacing[0]
                 img_y = (patient_pt[1] - origin[1]) / spacing[1]
             elif self.orientation == 'sagittal':
-                # After Z-axis resampling, each vertical pixel = y_spacing mm
                 img_x = (patient_pt[1] - origin[1]) / spacing[1]
-                img_y = self.display_image.height() - (patient_pt[2] - origin[2]) / spacing[1]
+                img_y = tc['img_h'] - (patient_pt[2] - origin[2]) / spacing[1]
             else:
-                # After Z-axis resampling, each vertical pixel = x_spacing mm
                 img_x = (patient_pt[0] - origin[0]) / spacing[0]
-                img_y = self.display_image.height() - (patient_pt[2] - origin[2]) / spacing[0]
+                img_y = tc['img_h'] - (patient_pt[2] - origin[2]) / spacing[0]
 
-        sx = offset_x + img_x * scale + self.image_frame.x()
-        sy = offset_y + img_y * scale + self.image_frame.y()
+        sx = tc['base_x'] + img_x * scale
+        sy = tc['base_y'] + img_y * scale
         return (sx, sy)
 
     def _patient_to_screen(self, point: Point3D) -> QPoint:
         """Convert patient coordinates to screen coordinates."""
         sx, sy = self._patient_to_screen_f(np.array([point.x, point.y, point.z]))
         return QPoint(int(sx), int(sy))
+
+    def _patient_points_to_screen_batch(self, points: list) -> list:
+        """Convert a list of Point3D to screen QPoints in one call (minimizes overhead)."""
+        tc = self._get_transform_cache()
+        if tc is None:
+            return [QPoint(0, 0)] * len(points)
+
+        scale = tc['scale']
+        base_x = tc['base_x']
+        base_y = tc['base_y']
+        result = []
+
+        if tc['oblique']:
+            vp_origin = tc['vp_origin']
+            col_dir = tc['col_dir']
+            row_dir = tc['row_dir']
+            inv_px_sp = 1.0 / tc['px_sp']
+            col_half = tc['col_half']
+            row_half = tc['row_half']
+            for p in points:
+                dx = p.x - vp_origin[0]
+                dy = p.y - vp_origin[1]
+                dz = p.z - vp_origin[2]
+                img_x = (dx * col_dir[0] + dy * col_dir[1] + dz * col_dir[2]) * inv_px_sp + col_half
+                img_y = (dx * row_dir[0] + dy * row_dir[1] + dz * row_dir[2]) * inv_px_sp + row_half
+                result.append(QPoint(int(base_x + img_x * scale), int(base_y + img_y * scale)))
+        else:
+            spacing = tc['spacing']
+            origin = tc['origin']
+            img_h = tc['img_h']
+
+            if self.orientation == 'axial':
+                inv_sx = 1.0 / spacing[0]
+                inv_sy = 1.0 / spacing[1]
+                ox, oy = origin[0], origin[1]
+                for p in points:
+                    ix = (p.x - ox) * inv_sx
+                    iy = (p.y - oy) * inv_sy
+                    result.append(QPoint(int(base_x + ix * scale), int(base_y + iy * scale)))
+            elif self.orientation == 'sagittal':
+                inv_sy = 1.0 / spacing[1]
+                oy, oz = origin[1], origin[2]
+                for p in points:
+                    ix = (p.y - oy) * inv_sy
+                    iy = img_h - (p.z - oz) * inv_sy
+                    result.append(QPoint(int(base_x + ix * scale), int(base_y + iy * scale)))
+            else:  # coronal
+                inv_sx = 1.0 / spacing[0]
+                ox, oz = origin[0], origin[2]
+                for p in points:
+                    ix = (p.x - ox) * inv_sx
+                    iy = img_h - (p.z - oz) * inv_sx
+                    result.append(QPoint(int(base_x + ix * scale), int(base_y + iy * scale)))
+
+        return result
 
     def _screen_to_patient_3d(self, screen_pos: QPoint) -> np.ndarray:
         """Convert screen position to 3D patient coordinates on this viewport's plane."""
@@ -871,7 +961,7 @@ class ViewportWidget(QWidget):
 
             # Handle Polygon rendering
             if measurement.type == 'polygon' and len(measurement.points) >= 3:
-                pts_screen = [self._patient_to_screen(p) for p in measurement.points]
+                pts_screen = self._patient_points_to_screen_batch(measurement.points)
 
                 pen = QPen(QColor(0, 255, 0))
                 if measurement == self.selected_measurement:
@@ -1173,7 +1263,7 @@ class ViewportWidget(QWidget):
             if not self._is_measurement_visible_here(m, current_plane):
                 continue
 
-            pts_screen = [self._patient_to_screen(p) for p in m.points]
+            pts_screen = self._patient_points_to_screen_batch(m.points)
 
             # Check axis hits first (they're drawn on top)
             if m.type == 'polygon' and m.show_axes and m.axes:
@@ -1917,7 +2007,7 @@ class ViewportWidget(QWidget):
 
     def _recompute_axes(self, m: Measurement):
         """Recompute auto-axes for a polygon measurement."""
-        pts_screen = [self._patient_to_screen(p) for p in m.points]
+        pts_screen = self._patient_points_to_screen_batch(m.points)
         self._auto_compute_axes(m, pts_screen)
         self._selected_axis_index = -1
         self.measurement_modified.emit(m)

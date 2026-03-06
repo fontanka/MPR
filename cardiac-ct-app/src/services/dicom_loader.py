@@ -677,22 +677,34 @@ class DICOMLoader:
     def apply_window(self, image: np.ndarray,
                      window_center: Optional[float] = None,
                      window_width: Optional[float] = None) -> np.ndarray:
+        """Apply window/level using cached LUT for int16 data (fast) or direct math (float)."""
         wc = window_center if window_center is not None else self.window_center
         ww = window_width if window_width is not None else self.window_width
-        
-        # Ensure valid window width
+
         if ww <= 0:
             ww = 400.0
-        
+
         min_val = wc - ww / 2
         max_val = wc + ww / 2
-        
-        clipped = np.clip(image, min_val, max_val)
-        
-        # Prevent division by zero
         if max_val == min_val:
             return np.zeros(image.shape, dtype=np.uint8)
-        
-        scaled = ((clipped - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-        
-        return scaled
+
+        # LUT path for int16 (standard axis-aligned slices)
+        if image.dtype == np.int16:
+            lut_key = (int(min_val * 10), int(max_val * 10))
+            cached = getattr(self, '_wl_lut_cache', (None, None))
+            if cached[0] == lut_key:
+                lut = cached[1]
+            else:
+                lut = np.zeros(65536, dtype=np.uint8)
+                imin = max(int(min_val) + 32768, 0)
+                imax = min(int(max_val) + 32768, 65535)
+                if imax > imin:
+                    lut[imin:imax + 1] = np.linspace(0, 255, imax - imin + 1, dtype=np.uint8)
+                lut[imax + 1:] = 255
+                self._wl_lut_cache = (lut_key, lut)
+            return lut[(image.astype(np.int32) + 32768).clip(0, 65535).astype(np.uint16)]
+
+        # Fallback for float arrays (oblique slices)
+        clipped = np.clip(image, min_val, max_val)
+        return ((clipped - min_val) / (max_val - min_val) * 255).astype(np.uint8)

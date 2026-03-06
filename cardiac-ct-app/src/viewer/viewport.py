@@ -162,6 +162,13 @@ class ViewportWidget(QWidget):
         self._pending_rotation: Optional[tuple] = None
         self._pending_locked_rotation: Optional[tuple] = None
 
+        # Cursor ball throttle — avoid triple repaint on every mouse pixel
+        self._cursor_ball_throttle = QTimer()
+        self._cursor_ball_throttle.setSingleShot(True)
+        self._cursor_ball_throttle.setInterval(30)
+        self._cursor_ball_throttle.timeout.connect(self._emit_pending_cursor_ball)
+        self._pending_cursor_ball: Optional[tuple] = None  # (pos, color)
+
         # Polygon points for polygon tool
         self.polygon_points: List[Point3D] = []
 
@@ -196,8 +203,15 @@ class ViewportWidget(QWidget):
         self._oblique_col_count: int = 0
         self._oblique_row_count: int = 0
 
+        # Cached slice data (raw HU) — avoids re-extracting on W/L changes
+        self._cached_raw_slice: Optional[np.ndarray] = None
+        self._cached_slice_key: Optional[tuple] = None  # (orientation, slice_index) or oblique hash
+
         # Cached pixmap (avoid QPixmap.fromImage every paint)
         self._cached_pixmap: Optional[QPixmap] = None
+
+        # Spline path cache per measurement id
+        self._spline_cache: Dict[str, Tuple[list, QPainterPath]] = {}  # id -> (pts_key, path)
 
         # Window/level drag state
         self._wl_dragging: bool = False
@@ -352,53 +366,57 @@ class ViewportWidget(QWidget):
         """Check if this viewport needs oblique rendering."""
         return self.view_plane is not None and not self.view_plane.is_axis_aligned()
 
-    def _update_display(self):
-        """Update the displayed image."""
+    def _update_display(self, wl_only: bool = False):
+        """Update the displayed image.
+
+        Args:
+            wl_only: If True, reuse cached raw slice and only reapply window/level.
+                     Much faster than full re-slice (skips volume access + resampling).
+        """
         if not self.loader or self.loader.volume is None:
             return
 
-        if self._is_oblique() and self.view_plane is not None:
-            # Oblique rendering path
-            result = self.loader.get_oblique_slice_patient(
-                self.view_plane.origin,
-                self.view_plane.col_dir,
-                self.view_plane.row_dir
-            )
-            if result is None:
-                return
-            slice_data, self._oblique_pixel_spacing = result
-            self._oblique_row_count, self._oblique_col_count = slice_data.shape
+        is_oblique = self._is_oblique()
 
-            display_data = self.loader.apply_window(slice_data,
-                                                     self.window_center,
-                                                     self.window_width)
-        else:
-            # Standard axis-aligned rendering (fast path)
-            if self.orientation == 'axial':
-                slice_data = self.loader.get_axial_slice(self.current_slice)
-            elif self.orientation == 'sagittal':
-                slice_data = self.loader.get_sagittal_slice(self.current_slice)
+        if not wl_only or self._cached_raw_slice is None:
+            # Full re-slice path
+            if is_oblique and self.view_plane is not None:
+                result = self.loader.get_oblique_slice_patient(
+                    self.view_plane.origin,
+                    self.view_plane.col_dir,
+                    self.view_plane.row_dir
+                )
+                if result is None:
+                    return
+                slice_data, self._oblique_pixel_spacing = result
+                self._oblique_row_count, self._oblique_col_count = slice_data.shape
             else:
-                slice_data = self.loader.get_coronal_slice(self.current_slice)
+                if self.orientation == 'axial':
+                    slice_data = self.loader.get_axial_slice(self.current_slice)
+                elif self.orientation == 'sagittal':
+                    slice_data = self.loader.get_sagittal_slice(self.current_slice)
+                else:
+                    slice_data = self.loader.get_coronal_slice(self.current_slice)
 
-            if slice_data is None:
-                return
+                if slice_data is None:
+                    return
 
-            display_data = self.loader.apply_window(slice_data,
-                                                     self.window_center,
-                                                     self.window_width)
+                if self.orientation in ['sagittal', 'coronal']:
+                    slice_data = np.ascontiguousarray(np.flipud(slice_data))
 
-            if self.orientation in ['sagittal', 'coronal']:
-                display_data = np.flipud(display_data)
+            self._cached_raw_slice = slice_data
 
+        # Apply window/level (fast: just a LUT operation on cached slice)
+        display_data = self.loader.apply_window(self._cached_raw_slice,
+                                                 self.window_center,
+                                                 self.window_width)
         display_data = np.ascontiguousarray(display_data, dtype=np.uint8)
 
         h, w = display_data.shape
-        bytes_data = display_data.tobytes()
-        self.display_image = QImage(bytes_data, w, h, w, QImage.Format_Grayscale8).copy()
+        self.display_image = QImage(display_data.data, w, h, w, QImage.Format_Grayscale8).copy()
         self._cached_pixmap = QPixmap.fromImage(self.display_image)
 
-        oblique_indicator = " ◇" if self._is_oblique() else ""
+        oblique_indicator = " ◇" if is_oblique else ""
         self.slice_label.setText(
             f"{self.current_slice + 1}/{self.max_slice + 1}{oblique_indicator}"
         )
@@ -406,32 +424,53 @@ class ViewportWidget(QWidget):
         self.update()
 
     def _get_current_plane(self) -> PlaneDefinition:
-        """Get the current plane definition in patient coordinates."""
+        """Get the current plane definition in patient coordinates (cached per slice/plane)."""
+        # Build a lightweight cache key
+        if self.view_plane is not None:
+            key = (id(self.view_plane), self.view_plane.origin.tobytes())
+        else:
+            key = (self.orientation, self.current_slice)
+
+        cached = getattr(self, '_cached_plane', None)
+        cached_key = getattr(self, '_cached_plane_key', None)
+        if cached is not None and cached_key == key:
+            return cached
+
         if not self.loader:
-            return get_axial_plane(0)
+            plane = get_axial_plane(0)
+            self._cached_plane = plane
+            self._cached_plane_key = key
+            return plane
 
         if self.view_plane:
             n = self.view_plane.normal
             o = self.view_plane.origin
             up = -self.view_plane.row_dir
-            return PlaneDefinition(
+            plane = PlaneDefinition(
                 origin=Point3D(x=float(o[0]), y=float(o[1]), z=float(o[2])),
                 normal=Point3D(x=float(n[0]), y=float(n[1]), z=float(n[2])),
                 view_up=Point3D(x=float(up[0]), y=float(up[1]), z=float(up[2]))
             )
+            self._cached_plane = plane
+            self._cached_plane_key = key
+            return plane
 
         spacing = self.loader.spacing
         origin = self.loader.origin
 
         if self.orientation == 'axial':
             z_pos = origin[2] + self.current_slice * spacing[2]
-            return get_axial_plane(z_pos)
+            plane = get_axial_plane(z_pos)
         elif self.orientation == 'sagittal':
             x_pos = origin[0] + self.current_slice * spacing[0]
-            return get_sagittal_plane(x_pos)
+            plane = get_sagittal_plane(x_pos)
         else:
             y_pos = origin[1] + self.current_slice * spacing[1]
-            return get_coronal_plane(y_pos)
+            plane = get_coronal_plane(y_pos)
+
+        self._cached_plane = plane
+        self._cached_plane_key = key
+        return plane
 
     # ─── Coordinate Transforms ───
 
@@ -840,24 +879,11 @@ class ViewportWidget(QWidget):
                 pen.setWidth(2)
                 painter.setPen(pen)
 
-                # Draw Spline
-                try:
-                    x = [p.x() for p in pts_screen]
-                    y = [p.y() for p in pts_screen]
-
-                    tck, u = splprep([x, y], s=0, per=True)
-                    num_segments = len(pts_screen)
-                    smooth_x, smooth_y = splev(np.linspace(0, 1, num_segments * 20), tck)
-
-                    path = QPainterPath()
-                    path.moveTo(smooth_x[0], smooth_y[0])
-                    for i in range(1, len(smooth_x)):
-                        path.lineTo(smooth_x[i], smooth_y[i])
-
+                # Draw Spline (cached to avoid splprep/splev every frame)
+                path = self._get_cached_spline_path(measurement.id, pts_screen)
+                if path:
                     painter.drawPath(path)
-
-                except Exception as e:
-                    print(f"Spline error: {e}")
+                else:
                     for i in range(len(pts_screen)):
                         p1 = pts_screen[i]
                         p2 = pts_screen[(i+1) % len(pts_screen)]
@@ -1208,6 +1234,35 @@ class ViewportWidget(QWidget):
 
         return None, None
 
+    def _get_cached_spline_path(self, meas_id: str, pts_screen: List[QPoint]) -> Optional[QPainterPath]:
+        """Get cached spline QPainterPath, recomputing only when screen points change."""
+        pts_key = [(p.x(), p.y()) for p in pts_screen]
+        cached = self._spline_cache.get(meas_id)
+        if cached and cached[0] == pts_key:
+            return cached[1]
+
+        try:
+            x = [p.x() for p in pts_screen]
+            y = [p.y() for p in pts_screen]
+            tck, u = splprep([x, y], s=0, per=True)
+            smooth_x, smooth_y = splev(np.linspace(0, 1, len(pts_screen) * 20), tck)
+            path = QPainterPath()
+            path.moveTo(smooth_x[0], smooth_y[0])
+            for i in range(1, len(smooth_x)):
+                path.lineTo(smooth_x[i], smooth_y[i])
+            self._spline_cache[meas_id] = (pts_key, path)
+            return path
+        except Exception:
+            self._spline_cache.pop(meas_id, None)
+            return None
+
+    def invalidate_spline_cache(self, meas_id: str = ""):
+        """Clear spline cache for a measurement, or all if empty."""
+        if meas_id:
+            self._spline_cache.pop(meas_id, None)
+        else:
+            self._spline_cache.clear()
+
     def _get_label_screen_pos(self, measurement: Measurement, pts_screen: List[QPoint]) -> QPoint:
         """Get the screen position for the label."""
         if measurement.label_position:
@@ -1371,6 +1426,13 @@ class ViewportWidget(QWidget):
             self.arm_rotated.emit(*self._pending_locked_rotation)
             self._pending_locked_rotation = None
 
+    def _emit_pending_cursor_ball(self):
+        """Emit throttled cursor ball update."""
+        if self._pending_cursor_ball is not None:
+            pos, color = self._pending_cursor_ball
+            self.cursor_ball_changed.emit(pos, color)
+            self._pending_cursor_ball = None
+
     def _start_arm_rotation(self, event: QMouseEvent, arm_orient: str):
         """Start rotating an arm (linked viewport's plane)."""
         self.rotating_arm = arm_orient
@@ -1416,7 +1478,7 @@ class ViewportWidget(QWidget):
             if self._wl_dragging:
                 self.window_width = max(1.0, self._wl_start_width + dx * 2.0)
                 self.window_center = self._wl_start_center - dy * 2.0
-                self._update_display()
+                self._update_display(wl_only=True)
                 self.window_level_changed.emit(self.window_center, self.window_width)
             return
 
@@ -1500,12 +1562,15 @@ class ViewportWidget(QWidget):
             if old_hover_arm != self._hover_arm or old_hover_int != self._hover_intersection:
                 needs_repaint = True
 
-            # Cursor ball: emit 3D position when hovering over a crosshair arm
+            # Cursor ball: throttled emit to avoid triple repaint per mouse pixel
             if self._hover_arm and self.mpr_state:
                 ball_pos = self._screen_to_patient_3d(event.pos())
                 ball_color = VIEWPORT_COLORS.get(self._hover_arm, QColor(255, 255, 255))
-                self.cursor_ball_changed.emit(ball_pos, ball_color)
-            elif not self._hover_arm:
+                self._pending_cursor_ball = (ball_pos, ball_color)
+                if not self._cursor_ball_throttle.isActive():
+                    self._cursor_ball_throttle.start()
+            elif not self._hover_arm and self._pending_cursor_ball is not None:
+                self._pending_cursor_ball = None
                 self.cursor_ball_changed.emit(None, None)
 
         if self.measuring:
@@ -1595,8 +1660,9 @@ class ViewportWidget(QWidget):
         if self._wl_dragging:
             self._wl_dragging = False
             self._wl_start_pos = None
-        if self._hover_arm:
-            self._hover_arm = None
+        if self._hover_arm or self._pending_cursor_ball is not None:
+            self._cursor_ball_throttle.stop()
+            self._pending_cursor_ball = None
             self.cursor_ball_changed.emit(None, None)
         self._hover_arm = None
         self._hover_intersection = False

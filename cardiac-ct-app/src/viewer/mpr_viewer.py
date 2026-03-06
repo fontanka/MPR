@@ -494,7 +494,7 @@ class MPRViewer(QWidget):
             vp.window_center = center
             vp.window_width = width
             if vp.display_image is not None:
-                vp._update_display()
+                vp._update_display(wl_only=True)
         self.window_level_changed.emit(center, width)
 
     def delete_measurement(self, measurement_id: str):

@@ -41,49 +41,43 @@ def project_point_to_plane(point: Point3D, plane: PlaneDefinition) -> Point3D:
 def distance_to_plane(point: Point3D, plane: PlaneDefinition) -> float:
     """
     Calculate the signed distance from a point to a plane.
-    
-    Args:
-        point: The 3D point
-        plane: The plane definition
-        
-    Returns:
-        Signed distance in mm (positive if on normal side, negative otherwise)
+    Uses pure Python math to avoid numpy allocation overhead in hot loops.
     """
-    p = np.array([point.x, point.y, point.z])
-    origin = np.array([plane.origin.x, plane.origin.y, plane.origin.z])
-    normal = np.array([plane.normal.x, plane.normal.y, plane.normal.z])
-
-    # Normalize
-    norm = np.linalg.norm(normal)
-    if norm < 1e-10:
+    nx = plane.normal.x
+    ny = plane.normal.y
+    nz = plane.normal.z
+    norm_sq = nx * nx + ny * ny + nz * nz
+    if norm_sq < 1e-20:
         return 0.0
-    normal = normal / norm
+    inv_norm = 1.0 / (norm_sq ** 0.5)
+    dx = point.x - plane.origin.x
+    dy = point.y - plane.origin.y
+    dz = point.z - plane.origin.z
+    return (dx * nx + dy * ny + dz * nz) * inv_norm
 
-    return float(np.dot(p - origin, normal))
 
-
-def is_measurement_visible(measurement: Measurement, 
+def is_measurement_visible(measurement: Measurement,
                            current_plane: PlaneDefinition,
                            tolerance: float = 2.0) -> bool:
     """
     Determine if a measurement should be visible on the current plane.
-    
-    A measurement is visible if all its points are within the tolerance
-    distance from the current viewing plane.
-    
-    Args:
-        measurement: The measurement to check
-        current_plane: The current viewing plane
-        tolerance: Maximum distance in mm for visibility (default: 2.0mm)
-        
-    Returns:
-        True if the measurement should be visible
+    Optimized: pre-computes normalized normal to avoid repeated normalization.
     """
     if not measurement.points:
         return False
+    nx = current_plane.normal.x
+    ny = current_plane.normal.y
+    nz = current_plane.normal.z
+    norm_sq = nx * nx + ny * ny + nz * nz
+    if norm_sq < 1e-20:
+        return False
+    inv_norm = 1.0 / (norm_sq ** 0.5)
+    ox = current_plane.origin.x
+    oy = current_plane.origin.y
+    oz = current_plane.origin.z
     for point in measurement.points:
-        dist = abs(distance_to_plane(point, current_plane))
-        if dist > tolerance:
+        d = abs(((point.x - ox) * nx + (point.y - oy) * ny + (point.z - oz) * nz) * inv_norm)
+        if d > tolerance:
             return False
     return True
 

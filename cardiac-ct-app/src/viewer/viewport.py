@@ -168,6 +168,7 @@ class ViewportWidget(QWidget):
         # Measurements to display
         self.measurements: List[Measurement] = []
         self.tolerance_mm: float = 2.0
+        self.restrict_to_source_orientation: bool = False  # when True, only show on source viewport
 
         # Measurement tool state
         self.measuring: bool = False
@@ -809,12 +810,24 @@ class ViewportWidget(QWidget):
 
     # ─── Measurement Drawing ───
 
+    def _is_measurement_visible_here(self, measurement: Measurement, current_plane: PlaneDefinition) -> bool:
+        """Check if a measurement should be visible on this viewport."""
+        if not is_measurement_visible(measurement, current_plane, self.tolerance_mm):
+            return False
+        # Orientation restriction: only show on source viewport unless flagged
+        if (self.restrict_to_source_orientation
+                and measurement.source_orientation
+                and measurement.source_orientation != self.orientation
+                and not measurement.show_all_viewports):
+            return False
+        return True
+
     def _draw_measurements(self, painter: QPainter):
         """Draw all visible measurements."""
         current_plane = self._get_current_plane()
 
         for measurement in self.measurements:
-            if not is_measurement_visible(measurement, current_plane, self.tolerance_mm):
+            if not self._is_measurement_visible_here(measurement, current_plane):
                 continue
 
             # Handle Polygon rendering
@@ -1129,9 +1142,9 @@ class ViewportWidget(QWidget):
         """
         tol = 8
 
+        current_plane = self._get_current_plane()
         for m in self.measurements:
-            current_plane = self._get_current_plane()
-            if not is_measurement_visible(m, current_plane, self.tolerance_mm):
+            if not self._is_measurement_visible_here(m, current_plane):
                 continue
 
             pts_screen = [self._patient_to_screen(p) for p in m.points]
@@ -1792,6 +1805,17 @@ class ViewportWidget(QWidget):
 
             menu.addSeparator()
 
+            # Show on all viewports toggle
+            all_vp_action = QAction("Show on All Viewports", self)
+            all_vp_action.setCheckable(True)
+            all_vp_action.setChecked(m.show_all_viewports)
+            all_vp_action.triggered.connect(
+                lambda checked, _m=m: self._toggle_show_all_viewports(_m, checked)
+            )
+            menu.addAction(all_vp_action)
+
+            menu.addSeparator()
+
             delete_action = QAction("Delete Measurement", self)
             delete_action.triggered.connect(
                 lambda _=False, _m=m: (
@@ -1803,6 +1827,12 @@ class ViewportWidget(QWidget):
             menu.addAction(delete_action)
 
             menu.exec(event.globalPos())
+
+    def _toggle_show_all_viewports(self, m: Measurement, checked: bool):
+        """Toggle whether measurement is visible on all viewports."""
+        m.show_all_viewports = checked
+        self.measurement_modified.emit(m)
+        self.update()
 
     def _delete_axis(self, m: Measurement, idx: int):
         """Delete an axis from a measurement."""

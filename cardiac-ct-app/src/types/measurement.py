@@ -111,6 +111,8 @@ class Measurement:
     label_position: Optional[Point3D] = None
     show_axes: bool = False
     axes: List[AxisLine] = field(default_factory=list)
+    source_orientation: str = ""  # 'axial', 'sagittal', 'coronal' — viewport where created
+    show_all_viewports: bool = False  # if True, show on all viewports (not just source)
     
     def to_dict(self) -> dict:
         return {
@@ -129,7 +131,9 @@ class Measurement:
             "screenshotPath": self.screenshot_path,
             "label_position": self.label_position.to_dict() if self.label_position else None,
             "show_axes": self.show_axes,
-            "axes": [a.to_dict() for a in self.axes]
+            "axes": [a.to_dict() for a in self.axes],
+            "source_orientation": self.source_orientation,
+            "show_all_viewports": self.show_all_viewports
         }
     
     @classmethod
@@ -150,7 +154,9 @@ class Measurement:
             screenshot_path=data.get("screenshotPath"),
             label_position=Point3D.from_dict(data["label_position"]) if data.get("label_position") else None,
             show_axes=data.get("show_axes", False),
-            axes=[AxisLine.from_dict(a) for a in data.get("axes", [])]
+            axes=[AxisLine.from_dict(a) for a in data.get("axes", [])],
+            source_orientation=data.get("source_orientation", ""),
+            show_all_viewports=data.get("show_all_viewports", False)
         )
     
     @staticmethod

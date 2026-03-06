@@ -341,7 +341,8 @@ class MPRViewer(QWidget):
             plane=self._get_current_plane(orientation),
             value=value,
             timestamp=datetime.datetime.now().isoformat(),
-            user_id="local-user"
+            user_id="local-user",
+            source_orientation=orientation
         )
 
         self.measurement_service.add_measurement(measurement)
@@ -384,6 +385,7 @@ class MPRViewer(QWidget):
             plane=self._get_current_plane(orientation),
             value=value,
             timestamp=datetime.datetime.now().isoformat(),
+            source_orientation=orientation,
             user_id="local-user"
         )
 
@@ -537,6 +539,12 @@ class MPRViewer(QWidget):
             if vp.selected_measurement:
                 return vp.selected_measurement
         return None
+
+    def set_restrict_measurements_to_source(self, restricted: bool):
+        """Toggle whether measurements only show on their source viewport."""
+        for vp in self._viewports():
+            vp.restrict_to_source_orientation = restricted
+            vp.update()
 
     def reset_oblique(self):
         """Reset all viewports to standard axis-aligned planes."""

@@ -173,6 +173,20 @@ class ViewportWidget(QWidget):
         self._pending_rotation: Optional[tuple] = None
         self._pending_locked_rotation: Optional[tuple] = None
 
+        # Intersection drag throttle — avoid re-slicing all 3 viewports per mouse pixel
+        self._intersection_drag_throttle = QTimer()
+        self._intersection_drag_throttle.setSingleShot(True)
+        self._intersection_drag_throttle.setInterval(30)
+        self._intersection_drag_throttle.timeout.connect(self._emit_pending_intersection_drag)
+        self._pending_intersection_drag: Optional[np.ndarray] = None
+
+        # Measurement drag throttle — avoid cascading 3-viewport repaints per mouse pixel
+        self._measurement_drag_throttle = QTimer()
+        self._measurement_drag_throttle.setSingleShot(True)
+        self._measurement_drag_throttle.setInterval(30)
+        self._measurement_drag_throttle.timeout.connect(self._emit_pending_measurement_modified)
+        self._pending_measurement_modified: Optional[Measurement] = None
+
         # Cursor ball throttle — avoid triple repaint on every mouse pixel
         self._cursor_ball_throttle = QTimer()
         self._cursor_ball_throttle.setSingleShot(True)
@@ -301,6 +315,7 @@ class ViewportWidget(QWidget):
     def set_loader(self, loader: DICOMLoader):
         """Set the DICOM loader and initialize the view."""
         self.loader = loader
+        self._cached_origin_arr = np.array(loader.origin) if loader else None
         if loader and loader.volume is not None:
             dims = loader.get_volume_dimensions()  # (Z, Y, X)
 
@@ -560,7 +575,8 @@ class ViewportWidget(QWidget):
                   self.view_plane.row_dir.tobytes()) if self.view_plane else None
         key = (frame_rect.width(), frame_rect.height(), img_w, img_h,
                self.zoom, self.pan_offset.x(), self.pan_offset.y(),
-               self.orientation, self.current_slice, vp_key)
+               self.orientation, self.current_slice, vp_key,
+               self._oblique_pixel_spacing, self._oblique_col_count, self._oblique_row_count)
 
         cached = getattr(self, '_transform_cache', None)
         if cached is not None and cached.get('_key') == key:
@@ -818,7 +834,10 @@ class ViewportWidget(QWidget):
             d_v = np.dot(line_dir_3d, my_plane.row_dir)
         elif self.display_image and self.loader:
             spacing = self.loader.spacing
-            origin_arr = np.array(self.loader.origin)
+            # Use cached origin array to avoid allocation per call
+            if not hasattr(self, '_cached_origin_arr') or self._cached_origin_arr is None:
+                self._cached_origin_arr = np.array(self.loader.origin)
+            origin_arr = self._cached_origin_arr
             row_count = self.display_image.height()
             if self.orientation == 'axial':
                 p_u = (p_3d[0] - origin_arr[0]) / spacing[0]
@@ -886,8 +905,6 @@ class ViewportWidget(QWidget):
         if not self.mpr_state or not self.view_plane:
             return
 
-        mouse_pos = self.mapFromGlobal(self.cursor().pos())
-
         # Draw colored intersection lines from the other two viewports' planes
         other_orientations = [o for o in self.mpr_state.planes if o != self.orientation]
         for other_orient in other_orientations:
@@ -899,12 +916,12 @@ class ViewportWidget(QWidget):
 
             p1, p2, _, _ = arm_line
 
-            # Check if mouse is near this arm
-            near_arm = self._is_near_line(mouse_pos, p1, p2, tolerance=8)
+            # Use stored hover state from mouseMoveEvent instead of querying cursor
+            is_hovered = self._hover_arm == other_orient
             is_active = self.rotating_arm == other_orient
 
             pen = QPen(color)
-            pen.setWidth(3 if (near_arm or is_active) else 1)
+            pen.setWidth(3 if (is_hovered or is_active) else 1)
             painter.setPen(pen)
             painter.drawLine(p1, p2)
 
@@ -1047,8 +1064,8 @@ class ViewportWidget(QWidget):
                 continue
 
             if len(measurement.points) >= 2:
-                p1_screen = self._patient_to_screen(measurement.points[0])
-                p2_screen = self._patient_to_screen(measurement.points[1])
+                pts = self._patient_points_to_screen_batch(measurement.points[:2])
+                p1_screen, p2_screen = pts[0], pts[1]
 
                 pen = QPen(QColor(0, 255, 0))
                 if measurement == self.selected_measurement:
@@ -1536,6 +1553,18 @@ class ViewportWidget(QWidget):
             self.cursor_ball_changed.emit(pos, color)
             self._pending_cursor_ball = None
 
+    def _emit_pending_intersection_drag(self):
+        """Emit throttled intersection drag update."""
+        if self._pending_intersection_drag is not None:
+            self.intersection_dragged.emit(self._pending_intersection_drag)
+            self._pending_intersection_drag = None
+
+    def _emit_pending_measurement_modified(self):
+        """Emit throttled measurement modified update."""
+        if self._pending_measurement_modified is not None:
+            self.measurement_modified.emit(self._pending_measurement_modified)
+            self._pending_measurement_modified = None
+
     def _start_arm_rotation(self, event: QMouseEvent, arm_orient: str):
         """Start rotating an arm (linked viewport's plane)."""
         self.rotating_arm = arm_orient
@@ -1585,10 +1614,12 @@ class ViewportWidget(QWidget):
                 self.window_level_changed.emit(self.window_center, self.window_width)
             return
 
-        # Handle intersection dragging
+        # Handle intersection dragging (throttled to ~33fps)
         if self.dragging_intersection and self.mpr_state and self.view_plane:
             new_3d = self._screen_to_patient_3d(event.pos())
-            self.intersection_dragged.emit(new_3d)
+            self._pending_intersection_drag = new_3d
+            if not self._intersection_drag_throttle.isActive():
+                self._intersection_drag_throttle.start()
             return
 
         # Handle arm rotation
@@ -1752,7 +1783,9 @@ class ViewportWidget(QWidget):
                 m.value = calculate_length(m.points[0], m.points[1])
 
             self.update()
-            self.measurement_modified.emit(m)
+            self._pending_measurement_modified = m
+            if not self._measurement_drag_throttle.isActive():
+                self._measurement_drag_throttle.start()
         elif needs_repaint:
             self.update()
 
@@ -1767,6 +1800,20 @@ class ViewportWidget(QWidget):
             self._cursor_ball_throttle.stop()
             self._pending_cursor_ball = None
             self.cursor_ball_changed.emit(None, None)
+        # Clear intersection drag state
+        if self.dragging_intersection:
+            self._intersection_drag_throttle.stop()
+            self._emit_pending_intersection_drag()
+            self.dragging_intersection = False
+        # Clear arm rotation state
+        if self.rotating_arm:
+            self._rotation_throttle.stop()
+            self._emit_pending_rotation()
+            self.rotating_arm = None
+            self.arm_rotate_center_screen = None
+            self.arm_rotate_initial_plane = None
+            self.arm_rotate_initial_other_plane = None
+            self._arm_rotate_third_orient = None
         self._hover_arm = None
         self._hover_intersection = False
         self.setCursor(Qt.ArrowCursor)
@@ -1818,8 +1865,10 @@ class ViewportWidget(QWidget):
             # No drag occurred — let Qt deliver contextMenuEvent
 
         if event.button() == Qt.LeftButton:
-            # End intersection drag
+            # End intersection drag — flush any pending throttled drag
             if self.dragging_intersection:
+                self._intersection_drag_throttle.stop()
+                self._emit_pending_intersection_drag()
                 self.dragging_intersection = False
                 self.setCursor(Qt.ArrowCursor)
                 event.accept()
@@ -1859,13 +1908,15 @@ class ViewportWidget(QWidget):
                 self.measure_end = None
                 self.update()
 
-            # Handle end of editing
+            # Handle end of editing — flush any pending throttled modification
             if self.drag_handle:
                 self.drag_handle = ""
                 self.drag_start_pos = None
                 self.drag_initial_points = []
                 if self.selected_measurement:
-                    self.measurement_modified.emit(self.selected_measurement)
+                    self._measurement_drag_throttle.stop()
+                    self._pending_measurement_modified = self.selected_measurement
+                    self._emit_pending_measurement_modified()
 
         super().mouseReleaseEvent(event)
 
